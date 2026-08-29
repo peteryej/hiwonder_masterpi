@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "masterpi-control"
+version = "0.1.0"
+description = "Safe browser and command-line control for Hiwonder MasterPi robots"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "MasterPi control contributors"}]
+dependencies = [
+  "gpiod>=2.2,<3",
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "pyserial>=3.5",
+  "PyYAML>=6.0",
+  "smbus2>=0.4.3",
+]
+
+[project.scripts]
+masterpi = "masterpi_control.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+masterpi_control = ["static/*.html"]

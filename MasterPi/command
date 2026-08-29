@@ -1,0 +1,75 @@
+#关掉开机自启(turn off auto-start on boot)
+sudo systemctl stop masterpi.service
+
+#重新开启开机自启(re-enable auto-start on boot)
+sudo systemctl restart masterpi.service
+
+#测试上位机(test PC software)
+python3 /home/pi/MasterPi/masterpi_pc_software/Arm.py
+
+# 测试电机和机械臂(test the motor and robotic arm)
+python3 /home/pi/MasterPi/board_demo/hardware_test.py
+或者按下扩展板的Key1按键(or press the Key1 button on the expansion board)
+
+# 软关机(soft shut down)
+# 长按Key2按键(long press the Key2 button)
+
+# 第2章 基础课程/1.麦轮小车运动学基础课程(2.Basic Lesson/1.Mecanum Wheel Car Control Lesson)
+# 第3课 小车前进(Lesson 3 Move Forward)
+python3 /home/pi/MasterPi/mecanum_control/car_forward_demo.py
+
+# 第4课 小车转向(Lesson 4 Turning)
+python3 /home/pi/MasterPi/mecanum_control/car_turn_demo.py
+
+# 第5课 小车前后左右运动(Lesson 5 Movement)
+python3 /home/pi/MasterPi/mecanum_control/car_move_demo.py
+
+# 第6课 小车斜向运动(Lesson 6 Oblique Movement)
+python3 /home/pi/MasterPi/mecanum_control/car_slant_demo.py
+
+# 第7课 小车漂移运动(Lesson 7 Drifting Movement)
+python3 /home/pi/MasterPi/mecanum_control/car_drifting_demo.py
+
+
+# 第2章 基础课程/2.机械臂逆运动学基础课程(2.Basic Lesson/2.Robotic Arm Inverse Kinematics Lesson)
+# 第3课 单次控制多个舵机(Lesson 3 Multiple Servos Control)
+
+# 第 4课 机械臂上下左右移动(Lesson 4 Control the Movement of Robotic Arm)
+
+
+
+# 第3章 进阶课程 1.AI视觉玩法课程(3.Advanced Lesson/1.AI Vision Games Lesson)
+# 第1课 颜色识别(Lesson 1 Color Recognition)
+python3 /home/pi/MasterPi/functions/color_detect.py
+
+# 第2课 颜色分拣(Lesson 2 Color Sorting)
+python3 /home/pi/MasterPi/functions/color_sorting.py
+
+# 第3课 目标追踪(Lesson 3 Target Tracking)
+python3 /home/pi/MasterPi/functions/color_tracking.py
+--Wheel 0
+--Wheel 1
+
+# 第4课 智能巡线(Lesson 4 Line Following)
+python3 /home/pi/MasterPi/functions/visual_patrol.py
+
+# 第5课 智能避障(Lesson 5 Obstacle Avoidance)
+python3 /home/pi/MasterPi/functions/avoidance.py
+
+# 第4章 拓展课程/3.扩展课程之树莓派扩展板课程(4.Expanded Lesson/3.Raspberry Pi Expansion Board Lesson)
+# 第4课 控制RGB闪烁(Lesson 4 RGB Flashing Control)
+python3 /home/pi/MasterPi/mecanum_control/rgb_controller_demo.py
+
+# 第5课 控制蜂鸣器(Lesson 5 Buzzer Control)
+python3 /home/pi/MasterPi/mecanum_control/buzzer_control_demo.py
+
+# 第6课 控制PWM舵机转动(Lesson 6 PWM Servo Rotation Control)
+python3 /home/pi/MasterPi/mecanum_control/pwm_servo_control_demo.py
+
+# 第7课 控制PWM舵机速度(Lesson 7 PWM Servo Speed Control)
+python3 /home/pi/MasterPi/mecanum_control/pwm_servo_control_demo.py
+
+# 第8课 驱动电机(Lesson 8 Drive Motor)
+python3 /home/pi/MasterPi/mecanum_control/motor_control_demo.py
+
+
