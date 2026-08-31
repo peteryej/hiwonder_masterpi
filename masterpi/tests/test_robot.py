@@ -1,5 +1,6 @@
 import time
 import unittest
+from unittest.mock import patch
 
 from masterpi_control.backends import MockBackend
 from masterpi_control.robot import Robot, ValidationError
@@ -45,6 +46,35 @@ class RobotTests(unittest.TestCase):
         closed = self.robot.gripper(False)
         self.assertEqual(opened["pulse"], 2000)
         self.assertEqual(closed["pulse"], 1500)
+
+    def test_nod_moves_gripper_pitch_up_and_down_then_level(self):
+        with patch("masterpi_control.robot.time.sleep"):
+            result = self.robot.nod()
+        arm_events = [event for event in self.backend.events if event["action"] == "arm"]
+        self.assertEqual(
+            [event["pitch"] for event in arm_events],
+            [0, 20, -20, 20, -20, 0],
+        )
+        self.assertTrue(
+            all(
+                event["x"] == 0 and event["y"] == 19 and event["z"] == 12
+                for event in arm_events
+            )
+        )
+        self.assertEqual(result, {"gesture": "nod", "cycles": 2})
+
+    def test_shake_moves_arm_left_and_right_twice_then_centers(self):
+        with patch("masterpi_control.robot.time.sleep"):
+            result = self.robot.shake()
+        arm_events = [event for event in self.backend.events if event["action"] == "arm"]
+        self.assertEqual([event["x"] for event in arm_events], [0, -5, 5, -5, 5, 0])
+        self.assertTrue(
+            all(
+                event["y"] == 14 and event["z"] == 20 and event["pitch"] == 0
+                for event in arm_events
+            )
+        )
+        self.assertEqual(result, {"gesture": "shake", "cycles": 2})
 
     def test_key2_click_moves_arm_home_once(self):
         self.backend.click_button(2)

@@ -3,6 +3,7 @@ import threading
 import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 from masterpi_control.backends import MockBackend
 from masterpi_control.robot import Robot
@@ -14,12 +15,31 @@ class FakeCamera:
         yield b"\xff\xd8camera-frame\xff\xd9"
 
 
+class FakeChat:
+    def __init__(self):
+        self.messages = []
+        self.audio = []
+
+    def reply(self, message):
+        self.messages.append(message)
+        return f"hibot heard: {message}"
+
+    def transcribe(self, audio, content_type):
+        self.audio.append((audio, content_type))
+        return "hello from microphone"
+
+    def synthesize(self, text):
+        return b"fake-mp3-audio", "audio/mpeg"
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.robot = Robot(MockBackend(), watchdog_timeout=0.3)
         self.camera = FakeCamera()
+        self.chat = FakeChat()
         self.server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), make_handler(self.robot, self.camera)
+            ("127.0.0.1", 0),
+            make_handler(self.robot, self.camera, self.chat, b"test-masterpi-ca"),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -39,6 +59,21 @@ class ServerTests(unittest.TestCase):
         payload = response.read()
         connection.close()
         return response.status, payload
+
+    def raw_request(self, method, path, body, content_type):
+        status, payload, _ = self.raw_request_with_type(
+            method, path, body, content_type
+        )
+        return status, payload
+
+    def raw_request_with_type(self, method, path, body, content_type):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+        connection.request(method, path, body, {"Content-Type": content_type})
+        response = connection.getresponse()
+        payload = response.read()
+        response_content_type = response.getheader("Content-Type")
+        connection.close()
+        return response.status, payload, response_content_type
 
     def test_control_page_and_state(self):
         status, page = self.request("GET", "/")
@@ -69,11 +104,16 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b'id="quickHome"', page)
         self.assertIn(b'id="quickOpen"', page)
         self.assertIn(b'id="quickClose"', page)
+        self.assertIn(b'id="quickNod"', page)
+        self.assertIn(b'id="quickShake"', page)
+        self.assertIn(b"'gesture/nod'", page)
+        self.assertIn(b"'gesture/shake'", page)
         self.assertEqual(page.count(b'class="quick-arm-preset secondary"'), 2)
-        self.assertIn(b'id="voiceDetected"', page)
-        self.assertIn(b'id="voicePhrase"', page)
-        self.assertIn(b'id="speakVoice"', page)
-        self.assertIn(b"cannot synthesize arbitrary text", page)
+        self.assertNotIn(b"WonderEcho voice", page)
+        self.assertNotIn(b'id="voiceDetected"', page)
+        self.assertNotIn(b'id="voicePhrase"', page)
+        self.assertNotIn(b'id="speakVoice"', page)
+        self.assertNotIn(b"/api/voice", page)
         self.assertNotIn(b"Reconnect camera", page)
         self.assertNotIn(b"Direct servo control", page)
         self.assertNotIn(b'id="setServo"', page)
@@ -86,6 +126,80 @@ class ServerTests(unittest.TestCase):
         status, payload = self.request("GET", "/api/state")
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(payload)["ok"])
+
+    def test_ca_certificate_can_be_downloaded_for_browser_trust(self):
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+        connection.request("GET", "/masterpi-ca.crt")
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Content-Type"), "application/x-x509-ca-cert")
+        self.assertEqual(payload, b"test-masterpi-ca")
+
+    def test_chat_section_is_immediately_below_chassis(self):
+        status, page = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        chassis_end = page.find(b"</section>", page.find(b'class="control-card"'))
+        chat_start = page.find(b'id="chatSection"')
+        self.assertGreater(chat_start, chassis_end)
+        self.assertIn(b'id="chatMessages"', page)
+        self.assertIn(b'id="chatInput"', page)
+        self.assertIn(b'id="recordAudio"', page)
+        self.assertIn(b'aria-label="Record audio"', page)
+        self.assertIn("🎤".encode(), page)
+        self.assertNotIn(b'id="audioFile"', page)
+        self.assertNotIn(b"capture", page)
+        self.assertIn(b"getUserMedia({audio:true, video:false})", page)
+        self.assertIn(b'id="secureAudioHelp"', page)
+        self.assertIn(b'id="secureAudioLink"', page)
+        self.assertIn(b'href="/masterpi-ca.crt"', page)
+        self.assertIn(b'id="speakReplies"', page)
+        self.assertIn(b'id="replyAudio" controls autoplay playsinline', page)
+        self.assertIn(b"/api/chat/tts", page)
+        self.assertIn(b"primeReplyAudio", page)
+        self.assertIn(b"decodeAudioData", page)
+        self.assertIn(b"MediaRecorder", page)
+
+    def test_text_chat_api_returns_hibot_reply(self):
+        status, payload = self.request(
+            "POST", "/api/chat", {"message": "How are you?"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload),
+            {"ok": True, "result": {"text": "hibot heard: How are you?"}},
+        )
+        self.assertEqual(self.chat.messages, ["How are you?"])
+
+    def test_chat_tts_api_returns_playable_audio(self):
+        status, payload, content_type = self.raw_request_with_type(
+            "POST",
+            "/api/chat/tts",
+            json.dumps({"text": "Hello from hibot"}).encode(),
+            "application/json",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "audio/mpeg")
+        self.assertEqual(payload, b"fake-mp3-audio")
+
+    def test_audio_chat_api_transcribes_and_replies(self):
+        status, payload = self.raw_request(
+            "POST", "/api/chat/audio", b"recorded-webm", "audio/webm;codecs=opus"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload),
+            {
+                "ok": True,
+                "transcript": "hello from microphone",
+                "result": {"text": "hibot heard: hello from microphone"},
+            },
+        )
+        self.assertEqual(
+            self.chat.audio, [(b"recorded-webm", "audio/webm;codecs=opus")]
+        )
+        self.assertEqual(self.chat.messages, ["hello from microphone"])
 
     def test_camera_stream_is_multipart_jpeg(self):
         connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
@@ -143,6 +257,19 @@ class ServerTests(unittest.TestCase):
         status, _ = self.request("POST", "/api/stop", {})
         self.assertEqual(status, 200)
         self.assertEqual(self.robot.snapshot()["drive"]["speed"], 0.0)
+
+    def test_nod_gesture_api(self):
+        with patch("masterpi_control.robot.time.sleep"):
+            status, payload = self.request("POST", "/api/gesture/nod", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"], {"gesture": "nod", "cycles": 2})
+
+    def test_shake_gesture_api(self):
+        with patch("masterpi_control.robot.time.sleep"):
+            status, payload = self.request("POST", "/api/gesture/shake", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"], {"gesture": "shake", "cycles": 2})
+        self.assertEqual(self.robot.snapshot()["arm"]["x"], 0.0)
 
     def test_validation_error_is_400(self):
         status, payload = self.request(

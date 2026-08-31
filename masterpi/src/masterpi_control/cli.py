@@ -25,6 +25,10 @@ def _parser() -> argparse.ArgumentParser:
     web.add_argument("--host", default="0.0.0.0")
     web.add_argument("--port", type=int, default=8000)
     web.add_argument("--watchdog", type=float, default=0.6, help="motion timeout in seconds")
+    web.add_argument("--tls-port", type=int, help="also serve HTTPS on this port")
+    web.add_argument("--certfile", help="HTTPS server certificate PEM")
+    web.add_argument("--keyfile", help="HTTPS private key PEM")
+    web.add_argument("--ca-certfile", help="CA certificate exposed for client installation")
 
     drive = sub.add_parser("drive", help="drive briefly, then stop")
     drive.add_argument("speed", type=float, help="linear speed, 0..100 mm/s")
@@ -89,7 +93,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         watchdog = args.watchdog if args.command == "serve" else 10.0
         robot = Robot(backend, watchdog_timeout=watchdog)
         if args.command == "serve":
-            serve(robot, args.host, args.port)
+            if args.tls_port and (not args.certfile or not args.keyfile):
+                raise ValidationError("--tls-port requires --certfile and --keyfile")
+            serve(
+                robot,
+                args.host,
+                args.port,
+                tls_port=args.tls_port,
+                certfile=args.certfile,
+                keyfile=args.keyfile,
+                ca_certfile=args.ca_certfile,
+            )
             return 0
         if args.command == "drive":
             if not 0 < args.seconds <= 60:

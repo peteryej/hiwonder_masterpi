@@ -4,6 +4,12 @@ MasterPi Control is a safe browser and command-line controller for the Hiwonder
 MasterPi robot. It controls the mecanum chassis, 5-DOF arm, gripper, PWM servos,
 two expansion-board RGB LEDs, and buzzer.
 
+The browser also includes a hibot chat panel directly below the chassis. It
+accepts typed messages and microphone recordings, keeps a named Hermes Agent
+conversation, displays text replies, and can read replies aloud through the
+browser. Chat runs with Hermes' restricted `safe` toolset because this server
+has no login.
+
 The implementation follows both generations of Hiwonder's Python API:
 
 - Current MasterPi images: `common.mecanum`,
@@ -80,6 +86,24 @@ different V4L2 device or stream URL:
 export MASTERPI_CAMERA_DEVICE=/dev/video1
 .venv/bin/masterpi serve
 ```
+
+The chat panel requires the `hermes` command and a configured Hermes model.
+Recorded messages use Hermes' configured speech-to-text provider. On browsers
+that block microphone access from a plain HTTP robot address, use HTTPS or
+localhost. The button uses browser `MediaRecorder` with `audio: true` and
+`video: false`; there is no camera/file-capture fallback. The **Speak replies**
+checkbox requests MP3 speech from Hermes' configured TTS provider. Enabling
+it primes a browser Web Audio context during the checkbox gesture, allowing
+later replies to play automatically after the asynchronous chat/TTS requests.
+An audio player remains available as a fallback for browsers with stricter
+site-level autoplay settings.
+
+The installed robot service keeps HTTP on port 8000 and provides trusted-local
+HTTPS on port 8443. From the HTTP page, use the certificate link in the chat
+panel to install and trust the MasterPi CA certificate on the client device,
+then open `https://10.0.0.102:8443/`. A private-IP certificate cannot be issued
+by a public certificate authority, so installing the local CA is required once
+on each browser device.
 
 The ultrasonic-distance card polls the Hiwonder I²C sensor at address `0x77`
 and displays centimetres. Its color picker controls both RGB LEDs on the
@@ -158,6 +182,8 @@ object, including `/api/stop`.
 | `GET /api/camera/stream` | none (MJPEG stream) |
 | `GET /api/distance` | none |
 | `GET /api/voice` | none |
+| `POST /api/chat` | `{"message":"Hello hibot"}` |
+| `POST /api/chat/audio` | raw `audio/*` body, up to 25 MiB |
 | `POST /api/sonar/rgb` | `{"red":0,"green":170,"blue":255}` |
 | `POST /api/voice/speak` | `{"phrase":"forward"}` |
 | `POST /api/drive` | `{"speed":40,"direction":90,"angular_rate":0}` |

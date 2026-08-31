@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from itertools import chain
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlsplit
 
 from .camera import CameraStream, CameraUnavailable
+from .chat import HermesChat
 from .robot import Robot, RobotError, ValidationError
 
 LOG = logging.getLogger(__name__)
 MAX_BODY_BYTES = 16 * 1024
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 
 def _index_html() -> bytes:
@@ -28,9 +33,22 @@ def _index_html() -> bytes:
 
 
 def make_handler(
-    robot: Robot, camera: Optional[CameraStream] = None
+    robot: Robot,
+    camera: Optional[CameraStream] = None,
+    chat: Any = None,
+    ca_certificate: Optional[bytes] = None,
 ) -> type[BaseHTTPRequestHandler]:
     index = _index_html()
+    chat_service = chat or HermesChat()
+
+    def chat_reply(data: Dict[str, Any]) -> Dict[str, str]:
+        message = data.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValidationError("message must be a non-empty string")
+        message = message.strip()
+        if len(message) > 4000:
+            raise ValidationError("message must be at most 4000 characters")
+        return {"text": chat_service.reply(message)}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MasterPiControl/0.1"
@@ -39,6 +57,14 @@ def make_handler(
             body = json.dumps(value, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_bytes(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -60,6 +86,18 @@ def make_handler(
             if not isinstance(value, dict):
                 raise ValidationError("Request body must be a JSON object")
             return value
+
+        def _read_audio(self) -> tuple[bytes, str]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValidationError("Invalid Content-Length") from exc
+            if length <= 0 or length > MAX_AUDIO_BYTES:
+                raise ValidationError("Audio must be between 1 byte and 25 MiB")
+            content_type = self.headers.get("Content-Type", "").strip().lower()
+            if not content_type.startswith("audio/"):
+                raise ValidationError("Content-Type must be audio/*")
+            return self.rfile.read(length), content_type
 
         def _send_camera_stream(self) -> None:
             if camera is None:
@@ -107,12 +145,11 @@ def make_handler(
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
             if path == "/":
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(index)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(index)
+                self._send_bytes(HTTPStatus.OK, index, "text/html; charset=utf-8")
+            elif path == "/masterpi-ca.crt" and ca_certificate is not None:
+                self._send_bytes(
+                    HTTPStatus.OK, ca_certificate, "application/x-x509-ca-cert"
+                )
             elif path == "/api/state":
                 self._send_json(HTTPStatus.OK, {"ok": True, "state": robot.snapshot()})
             elif path == "/api/distance":
@@ -143,8 +180,29 @@ def make_handler(
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
             try:
+                if path == "/api/chat/audio":
+                    audio, content_type = self._read_audio()
+                    transcript = chat_service.transcribe(audio, content_type)
+                    result = chat_reply({"message": transcript})
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"ok": True, "transcript": transcript, "result": result},
+                    )
+                    return
+                if path == "/api/chat/tts":
+                    data = self._read_json()
+                    text = data.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        raise ValidationError("text must be a non-empty string")
+                    text = text.strip()
+                    if len(text) > 4000:
+                        raise ValidationError("text must be at most 4000 characters")
+                    audio, content_type = chat_service.synthesize(text)
+                    self._send_bytes(HTTPStatus.OK, audio, content_type)
+                    return
                 data = self._read_json()
                 actions: Dict[str, Callable[[Dict[str, Any]], Any]] = {
+                    "/api/chat": chat_reply,
                     "/api/drive": lambda d: robot.drive(
                         d.get("speed"), d.get("direction"), d.get("angular_rate", 0)
                     ),
@@ -159,6 +217,8 @@ def make_handler(
                         d.get("duration", 1.0),
                     ),
                     "/api/home": lambda d: robot.home(d.get("duration", 1.5)),
+                    "/api/gesture/nod": lambda d: robot.nod(),
+                    "/api/gesture/shake": lambda d: robot.shake(),
                     "/api/servo": lambda d: robot.servo(
                         d.get("servo_id"), d.get("pulse"), d.get("duration", 0.5)
                     ),
@@ -207,14 +267,38 @@ def serve(
     host: str = "0.0.0.0",
     port: int = 8000,
     camera: Optional[CameraStream] = None,
+    tls_port: Optional[int] = None,
+    certfile: Optional[str] = None,
+    keyfile: Optional[str] = None,
+    ca_certfile: Optional[str] = None,
 ) -> None:
     camera_stream = camera or CameraStream()
-    server = ThreadingHTTPServer((host, port), make_handler(robot, camera_stream))
+    ca_certificate = Path(ca_certfile).read_bytes() if ca_certfile else None
+    handler = make_handler(robot, camera_stream, ca_certificate=ca_certificate)
+    server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
+    tls_server: Optional[ThreadingHTTPServer] = None
+    tls_thread: Optional[threading.Thread] = None
+    if tls_port is not None:
+        if not certfile or not keyfile:
+            raise ValidationError("TLS requires a certificate and private key")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        tls_server = ThreadingHTTPServer((host, tls_port), handler)
+        tls_server.daemon_threads = True
+        tls_server.socket = context.wrap_socket(tls_server.socket, server_side=True)
+        tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
+        tls_thread.start()
+        LOG.info("MasterPi secure control panel listening on https://%s:%d", host, tls_port)
     LOG.info("MasterPi control panel listening on http://%s:%d", host, port)
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
         server.server_close()
+        if tls_server is not None:
+            tls_server.shutdown()
+            tls_server.server_close()
+        if tls_thread is not None:
+            tls_thread.join(timeout=2)
         camera_stream.close()
         robot.close()

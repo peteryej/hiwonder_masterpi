@@ -40,6 +40,7 @@ within reach before running hardware demonstrations.
 - Hold-to-drive mecanum controls with a dead-man watchdog
 - Arm, gripper, direct-servo, RGB LED, and buzzer controls
 - A live USB camera stream with show/hide control
+- Text and recorded-audio chat with Hermes Agent, plus optional spoken replies
 - Live ultrasonic distance readings and ultrasonic RGB LED control
 - A validated JSON HTTP API
 - A mock backend and hardware-free automated tests

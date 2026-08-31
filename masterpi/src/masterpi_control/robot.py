@@ -80,6 +80,7 @@ class Robot:
         self.backend = backend
         self.watchdog_timeout = _number("watchdog_timeout", watchdog_timeout, 0.1, 10.0)
         self._lock = threading.RLock()
+        self._gesture_lock = threading.Lock()
         self._closed = threading.Event()
         self._moving = False
         self._last_drive = time.monotonic()
@@ -183,6 +184,26 @@ class Robot:
 
     def home(self, duration: Any = 1.5) -> Dict[str, float]:
         return self.arm(0, 6, 18, 0, -90, 90, duration)
+
+    def nod(self) -> Dict[str, Any]:
+        """Nod twice by moving the gripper pitch at a known-safe arm pose."""
+        with self._gesture_lock:
+            self.arm(0, 19, 12, 0, -90, 90, 0.8)
+            time.sleep(0.82)
+            for pitch in (20, -20, 20, -20, 0):
+                self.arm(0, 19, 12, pitch, -90, 90, 0.35)
+                time.sleep(0.37)
+        return {"gesture": "nod", "cycles": 2}
+
+    def shake(self) -> Dict[str, Any]:
+        """Shake twice by moving the arm left and right, then recenter it."""
+        with self._gesture_lock:
+            self.arm(0, 14, 20, 0, -90, 90, 0.8)
+            time.sleep(0.82)
+            for x in (-5, 5, -5, 5, 0):
+                self.arm(x, 14, 20, 0, -90, 90, 0.35)
+                time.sleep(0.37)
+        return {"gesture": "shake", "cycles": 2}
 
     def gripper(self, opened: Any, duration: Any = 0.5) -> Dict[str, Any]:
         if not isinstance(opened, bool):
