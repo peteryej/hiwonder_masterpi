@@ -48,8 +48,32 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b'id="cameraShell"', page)
         self.assertIn(b'id="toggleCamera"', page)
         self.assertIn(b"Hide camera", page)
+        self.assertLess(page.find(b'id="toggleCamera"'), page.find(b'id="cameraShell"'))
         self.assertIn(b'id="distanceValue"', page)
         self.assertIn(b'id="sonarColor"', page)
+        self.assertIn(b'class="control-card"', page)
+        self.assertIn(b'class="control-layout"', page)
+        self.assertIn(b'class="control-panel sensor-panel"', page)
+        self.assertIn(b'class="control-panel drive-panel"', page)
+        self.assertIn(b'class="control-panel quick-arm-panel"', page)
+        self.assertIn(b'@media (max-width: 520px)', page)
+        self.assertNotIn(
+            b'@media (max-width: 760px)', page
+        )
+        self.assertNotIn(b"<h2>Chassis</h2>", page)
+        self.assertNotIn(b"<h3>Ultrasonic distance</h3>", page)
+        self.assertLess(page.find(b'class="pad"'), page.find(b'id="speed"'))
+        self.assertLess(page.find(b'id="distanceValue"'), page.find(b'class="pad"'))
+        self.assertLess(page.find(b'class="pad"'), page.find(b'id="quickHome"'))
+        self.assertLess(page.find(b'id="quickClose"'), page.find(b'id="sonarColor"'))
+        self.assertIn(b'id="quickHome"', page)
+        self.assertIn(b'id="quickOpen"', page)
+        self.assertIn(b'id="quickClose"', page)
+        self.assertEqual(page.count(b'class="quick-arm-preset secondary"'), 2)
+        self.assertIn(b'id="voiceDetected"', page)
+        self.assertIn(b'id="voicePhrase"', page)
+        self.assertIn(b'id="speakVoice"', page)
+        self.assertIn(b"cannot synthesize arbitrary text", page)
         self.assertNotIn(b"Reconnect camera", page)
         self.assertNotIn(b"Direct servo control", page)
         self.assertNotIn(b'id="setServo"', page)
@@ -94,6 +118,21 @@ class ServerTests(unittest.TestCase):
             {"red": 12, "green": 34, "blue": 56},
         )
         self.assertEqual(self.robot.backend.events[-1]["action"], "sonar_rgb")
+
+    def test_wonderecho_recognition_and_broadcast_api(self):
+        self.robot.backend.recognize_voice(4)
+        status, payload = self.request("GET", "/api/voice")
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertTrue(result["detected"])
+        self.assertEqual(result["last"]["phrase"], "Turn right")
+
+        status, payload = self.request(
+            "POST", "/api/voice/speak", {"phrase": "forward"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["spoken_text"], "Going forward")
+        self.assertEqual(self.robot.backend.events[-1]["action"], "voice_speak")
 
     def test_drive_and_stop_api(self):
         status, payload = self.request(

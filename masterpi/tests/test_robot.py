@@ -90,12 +90,45 @@ class RobotTests(unittest.TestCase):
         self.assertEqual(self.backend.events[-1]["action"], "sonar_rgb")
         self.assertEqual(self.robot.snapshot()["sonar_rgb"], result)
 
+    def test_voice_result_reports_recognized_phrase_without_moving(self):
+        self.backend.recognize_voice(3)
+        before_arm = self.robot.snapshot()["arm"]
+        result = self.robot.voice_result()
+        self.assertTrue(result["detected"])
+        self.assertEqual(result["last"]["phrase"], "Turn left")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(self.robot.snapshot()["arm"], before_arm)
+        self.assertEqual(self.robot.snapshot()["drive"]["speed"], 0.0)
+
+    def test_voice_broadcast_is_limited_to_firmware_phrases(self):
+        result = self.robot.voice_speak("forward")
+        self.assertEqual(result["spoken_text"], "Going forward")
+        self.assertEqual(
+            self.backend.events[-1],
+            {
+                "action": "voice_speak",
+                "time": self.backend.events[-1]["time"],
+                "phrase_type": 0,
+                "phrase_id": 1,
+            },
+        )
+        with self.assertRaisesRegex(ValidationError, "cannot speak arbitrary text"):
+            self.robot.voice_speak("hello from the webpage")
+
     def test_watchdog_stops_stale_motion(self):
         self.robot.drive(40, 90, 0)
         time.sleep(0.25)
         state = self.robot.snapshot()
         self.assertEqual(state["drive"]["speed"], 0.0)
         self.assertEqual(state["watchdog_stops"], 1)
+
+    def test_idle_controller_reasserts_motor_stop(self):
+        initial_stops = len(self.backend.events)
+        time.sleep(0.6)
+        state = self.robot.snapshot()
+        self.assertGreater(len(self.backend.events), initial_stops)
+        self.assertGreaterEqual(state["idle_stop_heartbeats"], 1)
+        self.assertEqual(self.backend.events[-1]["speed"], 0.0)
 
     def test_close_stops_chassis(self):
         self.robot.drive(20, 0, 0)

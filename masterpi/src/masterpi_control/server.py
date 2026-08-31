@@ -125,6 +125,16 @@ def make_handler(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         {"ok": False, "error": str(exc)},
                     )
+            elif path == "/api/voice":
+                try:
+                    self._send_json(
+                        HTTPStatus.OK, {"ok": True, "result": robot.voice_result()}
+                    )
+                except RobotError as exc:
+                    self._send_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"ok": False, "error": str(exc)},
+                    )
             elif path == "/api/camera/stream":
                 self._send_camera_stream()
             else:
@@ -159,6 +169,7 @@ def make_handler(
                     "/api/sonar/rgb": lambda d: robot.sonar_rgb(
                         d.get("red"), d.get("green"), d.get("blue")
                     ),
+                    "/api/voice/speak": lambda d: robot.voice_speak(d.get("phrase")),
                     "/api/buzzer": lambda d: robot.buzzer(
                         d.get("frequency", 1900),
                         d.get("on_time", 0.1),

@@ -22,9 +22,10 @@ power switch within reach.
 
 The browser uses hold-to-drive controls and sends a fresh command every 180 ms.
 The server has a dead-man watchdog: if updates stop for 600 ms, it stops all four
-motors. `Ctrl+C`, normal process shutdown, browser focus loss, and button/key
-release also issue a stop. This is a software safety layer, not a substitute for
-the physical power switch.
+motors. While idle, it also reasserts zero speed and duty on every motor channel
+twice per second, including after an expansion-board reset. `Ctrl+C`, normal
+process shutdown, browser focus loss, and button/key release also issue a stop.
+This is a software safety layer, not a substitute for the physical power switch.
 
 ## Install on the robot
 
@@ -92,6 +93,12 @@ The page reports the sensor as unavailable when `/dev/i2c-1` is missing or the
 sensor does not acknowledge on the bus; robot controls and camera streaming
 continue to operate normally.
 
+The WonderEcho card polls the voice module at I²C address `0x34` and displays
+recognized command IDs without assigning them to robot movement. Its broadcast
+selector can play several phrases already compiled into the factory firmware.
+WonderEcho is not a general text-to-speech engine, so arbitrary text requires
+building and flashing customized WonderEcho firmware.
+
 While the controller is running, pressing physical **KEY2** on the expansion
 board moves the arm to the Home pose (`x=0, y=6, z=18, pitch=0`). Hiwonder's
 keys are active-low Raspberry Pi inputs (KEY1=GPIO13, KEY2=GPIO23); the
@@ -150,7 +157,9 @@ object, including `/api/stop`.
 | `GET /api/state` | none |
 | `GET /api/camera/stream` | none (MJPEG stream) |
 | `GET /api/distance` | none |
+| `GET /api/voice` | none |
 | `POST /api/sonar/rgb` | `{"red":0,"green":170,"blue":255}` |
+| `POST /api/voice/speak` | `{"phrase":"forward"}` |
 | `POST /api/drive` | `{"speed":40,"direction":90,"angular_rate":0}` |
 | `POST /api/stop` | `{}` |
 | `POST /api/arm` | `{"x":0,"y":6,"z":18,"pitch":0,"duration":1.5}` |

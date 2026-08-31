@@ -30,6 +30,24 @@ BUTTON_EVENT_NAMES = {
     0x80: "triple click",
 }
 
+VOICE_COMMAND_NAMES = {
+    0x01: "Go straight",
+    0x02: "Go backward",
+    0x03: "Turn left",
+    0x04: "Turn right",
+    0x09: "Stop",
+}
+
+# WonderEcho broadcasts IDs already compiled into its firmware. It does not
+# synthesize arbitrary text, so expose only phrases documented by Hiwonder.
+VOICE_BROADCASTS = {
+    "forward": (0x00, 0x01, "Going forward"),
+    "backward": (0x00, 0x02, "Going backward"),
+    "left": (0x00, 0x03, "Turning left"),
+    "right": (0x00, 0x04, "Turning right"),
+    "received": (0x00, 0x09, "Received"),
+}
+
 
 def _number(name: str, value: Any, minimum: float, maximum: float) -> float:
     if isinstance(value, bool):
@@ -65,6 +83,8 @@ class Robot:
         self._closed = threading.Event()
         self._moving = False
         self._last_drive = time.monotonic()
+        self._last_chassis_stop = 0.0
+        self._voice_active_id = 0
         self._state: Dict[str, Any] = {
             "backend": getattr(backend, "details", {"name": backend.name}),
             "drive": {"speed": 0.0, "direction": 0.0, "angular_rate": 0.0},
@@ -73,15 +93,20 @@ class Robot:
             "rgb": {"red": 0, "green": 0, "blue": 0},
             "distance": None,
             "sonar_rgb": {"red": 0, "green": 0, "blue": 0},
+            "voice_last": None,
+            "voice_detection_count": 0,
+            "voice_broadcast": None,
             "last_button": None,
             "button_home_count": 0,
             "watchdog_stops": 0,
+            "idle_stop_heartbeats": 0,
             "last_error": None,
         }
         # The expansion board can retain the last motor duties across a client
         # restart.  Synchronize the physical chassis with our initial stopped
         # state before accepting commands or starting the watchdog.
         self.backend.stop()
+        self._last_chassis_stop = time.monotonic()
         self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watchdog.start()
         self._button_listener = threading.Thread(target=self._button_loop, daemon=True)
@@ -113,6 +138,7 @@ class Robot:
         with self._lock:
             if not self._closed.is_set():
                 self.backend.stop()
+                self._last_chassis_stop = time.monotonic()
             self._moving = False
             self._state["drive"] = command
         return command
@@ -228,6 +254,61 @@ class Robot:
             self._state["sonar_rgb"] = command
         return command
 
+    def voice_result(self) -> Dict[str, Any]:
+        """Poll WonderEcho without assigning recognized phrases to robot actions."""
+        with self._lock:
+            self._ensure_open()
+            try:
+                phrase_id = int(self.backend.voice_result())
+            except Exception as exc:
+                raise RobotError(str(exc)) from exc
+            if not 0 <= phrase_id <= 255:
+                raise RobotError("WonderEcho returned an invalid recognition ID")
+
+            detected = phrase_id != 0 and phrase_id != self._voice_active_id
+            if phrase_id == 0:
+                self._voice_active_id = 0
+            elif detected:
+                self._voice_active_id = phrase_id
+                event = {
+                    "id": phrase_id,
+                    "phrase": VOICE_COMMAND_NAMES.get(
+                        phrase_id, f"Command ID 0x{phrase_id:02X}"
+                    ),
+                    "detected_at": time.time(),
+                }
+                self._state["voice_last"] = event
+                self._state["voice_detection_count"] += 1
+
+            last = self._state["voice_last"]
+            return {
+                "detected": detected,
+                "current_id": phrase_id,
+                "last": None if last is None else dict(last),
+                "count": self._state["voice_detection_count"],
+            }
+
+    def voice_speak(self, phrase: Any) -> Dict[str, Any]:
+        if not isinstance(phrase, str):
+            raise ValidationError("phrase must be a supported phrase name")
+        key = phrase.strip().lower()
+        broadcast = VOICE_BROADCASTS.get(key)
+        if broadcast is None:
+            choices = ", ".join(VOICE_BROADCASTS)
+            raise ValidationError(
+                f"phrase must be one of: {choices}; WonderEcho cannot speak arbitrary text"
+            )
+        phrase_type, phrase_id, spoken_text = broadcast
+        with self._lock:
+            self._ensure_open()
+            try:
+                self.backend.voice_speak(phrase_type, phrase_id)
+            except Exception as exc:
+                raise RobotError(str(exc)) from exc
+            result = {"phrase": key, "spoken_text": spoken_text}
+            self._state["voice_broadcast"] = result
+        return result
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -242,6 +323,17 @@ class Robot:
                     else dict(self._state["distance"])
                 ),
                 "sonar_rgb": dict(self._state["sonar_rgb"]),
+                "voice_last": (
+                    None
+                    if self._state["voice_last"] is None
+                    else dict(self._state["voice_last"])
+                ),
+                "voice_detection_count": self._state["voice_detection_count"],
+                "voice_broadcast": (
+                    None
+                    if self._state["voice_broadcast"] is None
+                    else dict(self._state["voice_broadcast"])
+                ),
                 "last_button": (
                     None
                     if self._state["last_button"] is None
@@ -249,6 +341,7 @@ class Robot:
                 ),
                 "button_home_count": self._state["button_home_count"],
                 "watchdog_stops": self._state["watchdog_stops"],
+                "idle_stop_heartbeats": self._state["idle_stop_heartbeats"],
                 "last_error": self._state["last_error"],
                 "closed": self._closed.is_set(),
             }
@@ -257,12 +350,14 @@ class Robot:
         interval = min(self.watchdog_timeout / 4, 0.1)
         while not self._closed.wait(interval):
             with self._lock:
-                if self._moving and time.monotonic() - self._last_drive > self.watchdog_timeout:
+                now = time.monotonic()
+                if self._moving and now - self._last_drive > self.watchdog_timeout:
                     try:
                         self.backend.stop()
                     except Exception as exc:  # keep retrying a failed emergency stop
                         self._state["last_error"] = f"watchdog stop failed: {exc}"
                     else:
+                        self._last_chassis_stop = now
                         self._moving = False
                         self._state["drive"] = {
                             "speed": 0.0,
@@ -270,6 +365,17 @@ class Robot:
                             "angular_rate": 0.0,
                         }
                         self._state["watchdog_stops"] += 1
+                elif not self._moving and now - self._last_chassis_stop >= 0.5:
+                    # The expansion board can be reset independently while
+                    # this process keeps running. Reassert zero in both motor
+                    # modes so stale or reset channel state cannot persist.
+                    try:
+                        self.backend.stop()
+                    except Exception as exc:
+                        self._state["last_error"] = f"idle safety stop failed: {exc}"
+                    else:
+                        self._last_chassis_stop = now
+                        self._state["idle_stop_heartbeats"] += 1
 
     def _button_loop(self) -> None:
         """Map a press of expansion-board KEY2 to the arm Home pose."""
@@ -329,6 +435,7 @@ class Robot:
                     "direction": 0.0,
                     "angular_rate": 0.0,
                 }
+                self._last_chassis_stop = time.monotonic()
                 self._closed.set()
         if threading.current_thread() is not self._watchdog:
             self._watchdog.join(timeout=1)

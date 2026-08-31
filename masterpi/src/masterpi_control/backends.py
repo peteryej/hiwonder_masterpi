@@ -16,6 +16,13 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
+from smbus2 import SMBus
+
+
+WONDERECHO_ADDRESS = 0x34
+WONDERECHO_RESULT_REGISTER = 0x64
+WONDERECHO_SPEAK_REGISTER = 0x6E
+
 
 class BackendUnavailable(RuntimeError):
     """Raised when the vendor libraries are not installed or usable."""
@@ -41,6 +48,8 @@ class HardwareBackend(Protocol):
     def buzzer(self, frequency: int, on_time: float, off_time: float, repeat: int) -> None: ...
     def distance_mm(self) -> int: ...
     def sonar_rgb(self, red: int, green: int, blue: int) -> None: ...
+    def voice_result(self) -> int: ...
+    def voice_speak(self, phrase_type: int, phrase_id: int) -> None: ...
     def button_event(self) -> Optional[Tuple[int, int]]: ...
 
 
@@ -264,6 +273,10 @@ class VendorBackend:
             self._sonar = None
             self.sonar_module = "unavailable"
 
+        self.voice_module = (
+            "WonderEcho I2C 0x34" if Path("/dev/i2c-1").exists() else "unavailable"
+        )
+
     @staticmethod
     def _add_vendor_paths() -> None:
         """Make preinstalled SDK folders importable from any working directory."""
@@ -333,6 +346,7 @@ class VendorBackend:
             "board_module": self.board_module,
             "arm_module": self.arm_module,
             "sonar_module": self.sonar_module,
+            "voice_module": self.voice_module,
             "serial_device": self.serial_device,
             "button_source": self.button_source,
         }
@@ -478,6 +492,43 @@ class VendorBackend:
             detail = f": {cause}" if cause is not None else ""
             raise BackendUnavailable(f"Could not set ultrasonic sensor LEDs{detail}")
 
+    @staticmethod
+    def _require_voice_bus() -> None:
+        if not Path("/dev/i2c-1").exists():
+            raise BackendUnavailable(
+                "WonderEcho unavailable because /dev/i2c-1 is missing. "
+                "Enable Raspberry Pi I2C and reboot."
+            )
+
+    def voice_result(self) -> int:
+        """Read WonderEcho's one-byte recognized-command register."""
+        self._require_voice_bus()
+        try:
+            with SMBus(1) as bus:
+                values = bus.read_i2c_block_data(
+                    WONDERECHO_ADDRESS, WONDERECHO_RESULT_REGISTER, 1
+                )
+        except OSError as exc:
+            raise BackendUnavailable(
+                "WonderEcho did not respond at I2C address 0x34"
+            ) from exc
+        return int(values[0]) if values else 0
+
+    def voice_speak(self, phrase_type: int, phrase_id: int) -> None:
+        """Play one phrase already compiled into WonderEcho firmware."""
+        self._require_voice_bus()
+        try:
+            with SMBus(1) as bus:
+                bus.write_i2c_block_data(
+                    WONDERECHO_ADDRESS,
+                    WONDERECHO_SPEAK_REGISTER,
+                    [phrase_type, phrase_id],
+                )
+        except OSError as exc:
+            raise BackendUnavailable(
+                "WonderEcho did not respond at I2C address 0x34"
+            ) from exc
+
 
 @dataclass
 class MockBackend:
@@ -488,6 +539,7 @@ class MockBackend:
     state: Dict[str, Any] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _button_events: List[Tuple[int, int]] = field(default_factory=list, repr=False)
+    _voice_results: List[int] = field(default_factory=list, repr=False)
     mock_distance_mm: int = 420
 
     @property
@@ -560,3 +612,17 @@ class MockBackend:
 
     def sonar_rgb(self, red: int, green: int, blue: int) -> None:
         self._record("sonar_rgb", red=red, green=green, blue=blue)
+
+    def voice_result(self) -> int:
+        with self._lock:
+            if not self._voice_results:
+                return 0
+            return self._voice_results.pop(0)
+
+    def recognize_voice(self, phrase_id: int) -> None:
+        """Queue a WonderEcho result for controller tests and mock demos."""
+        with self._lock:
+            self._voice_results.append(phrase_id)
+
+    def voice_speak(self, phrase_type: int, phrase_id: int) -> None:
+        self._record("voice_speak", phrase_type=phrase_type, phrase_id=phrase_id)

@@ -1,6 +1,6 @@
 import unittest
 import queue
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from masterpi_control.backends import VendorBackend, _BoardMecanumChassis
 
@@ -218,6 +218,29 @@ class VendorBackendMappingTests(unittest.TestCase):
                 ("pixel", 1, (12, 34, 56)),
             ],
         )
+
+    def test_wonderecho_recognition_reads_documented_register(self):
+        value = backend(FakeModernBoard())
+        bus = MagicMock()
+        bus.__enter__.return_value = bus
+        bus.read_i2c_block_data.return_value = [3]
+        with (
+            patch("masterpi_control.backends.Path.exists", return_value=True),
+            patch("masterpi_control.backends.SMBus", return_value=bus),
+        ):
+            self.assertEqual(value.voice_result(), 3)
+        bus.read_i2c_block_data.assert_called_once_with(0x34, 0x64, 1)
+
+    def test_wonderecho_broadcast_writes_documented_register(self):
+        value = backend(FakeModernBoard())
+        bus = MagicMock()
+        bus.__enter__.return_value = bus
+        with (
+            patch("masterpi_control.backends.Path.exists", return_value=True),
+            patch("masterpi_control.backends.SMBus", return_value=bus),
+        ):
+            value.voice_speak(0x00, 0x01)
+        bus.write_i2c_block_data.assert_called_once_with(0x34, 0x6E, [0x00, 0x01])
 
     def test_legacy_tutorial_mapping(self):
         board = FakeLegacyBoard()
