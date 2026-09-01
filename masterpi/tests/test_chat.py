@@ -17,6 +17,24 @@ class FakeRunner:
             return subprocess.CompletedProcess(
                 command, 0, "session_id: test-session\nHello from hibot\n", ""
             )
+        if "vision_analyze_tool" in command[2]:
+            analysis = {
+                "description": "A bottle is in front of the robot.",
+                "objects": [
+                    {
+                        "label": "bottle",
+                        "confidence": 0.92,
+                        "bbox": {"x_min": 0.2, "y_min": 0.1, "x_max": 0.6, "y_max": 0.9},
+                    }
+                ],
+            }
+            result = {
+                "success": True,
+                "analysis": json.dumps(analysis),
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+            }
+            return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
         if "text_to_speech_tool" in command[2]:
             output_path = Path(command[-1])
             output_path.write_bytes(b"generated-mp3")
@@ -67,6 +85,17 @@ class HermesChatTests(unittest.TestCase):
         audio, content_type = HermesChat(runner=runner).synthesize("Hello")
         self.assertEqual(audio, b"generated-mp3")
         self.assertEqual(content_type, "audio/mpeg")
+
+    def test_analyze_image_returns_structured_objects_and_boxes(self):
+        runner = FakeRunner()
+        result = HermesChat(runner=runner).analyze_image(b"jpeg-data")
+        self.assertEqual(result["description"], "A bottle is in front of the robot.")
+        self.assertEqual(result["objects"][0]["label"], "bottle")
+        self.assertEqual(
+            result["objects"][0]["bbox"],
+            {"x_min": 0.2, "y_min": 0.1, "x_max": 0.6, "y_max": 0.9},
+        )
+        self.assertEqual(result["model"], "gpt-5.6-terra")
 
 
 if __name__ == "__main__":

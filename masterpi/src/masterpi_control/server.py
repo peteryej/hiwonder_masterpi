@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
 import ssl
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
@@ -17,6 +20,7 @@ from urllib.parse import urlsplit
 from .camera import CameraStream, CameraUnavailable
 from .chat import HermesChat
 from .robot import Robot, RobotError, ValidationError
+from .vision import VisionGrasper, annotate_object_detections
 
 LOG = logging.getLogger(__name__)
 MAX_BODY_BYTES = 16 * 1024
@@ -37,18 +41,137 @@ def make_handler(
     camera: Optional[CameraStream] = None,
     chat: Any = None,
     ca_certificate: Optional[bytes] = None,
+    vision_grasper: Any = None,
 ) -> type[BaseHTTPRequestHandler]:
     index = _index_html()
     chat_service = chat or HermesChat()
+    grasper = (
+        vision_grasper
+        if vision_grasper is not None
+        else (VisionGrasper(robot, camera) if camera is not None else None)
+    )
 
-    def chat_reply(data: Dict[str, Any]) -> Dict[str, str]:
+    def recognize_and_grab(data: Dict[str, Any]) -> Dict[str, Any]:
+        if grasper is None:
+            raise CameraUnavailable("Camera-guided grasping is not configured")
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            raise ValidationError("force must be true or false")
+        if force:
+            return grasper.grab_front()
+        return grasper.recognize_and_grab(data.get("target", "any"))
+
+    def agent_grab(data: Dict[str, Any]) -> Dict[str, Any]:
+        if grasper is None:
+            raise CameraUnavailable("Grasping is not configured")
+        return grasper.grab_front()
+
+    def analyze_color_camera(data: Dict[str, Any]) -> Dict[str, Any]:
+        if grasper is None:
+            raise CameraUnavailable("Camera analysis is not configured")
+        return grasper.analyze_scene(data.get("samples", 3))
+
+    def analyze_hermes_camera(data: Dict[str, Any]) -> Dict[str, Any]:
+        if camera is None:
+            raise CameraUnavailable("Camera analysis is not configured")
+        pose = robot.check_front(0.8)
+        time.sleep(0.85)
+        _, frame = camera.next_frame(timeout=3.0)
+        result = chat_service.analyze_image(frame)
+        annotated = annotate_object_detections(frame, result.get("objects", []))
+        result["annotated_image"] = (
+            "data:image/jpeg;base64," + base64.b64encode(annotated).decode("ascii")
+        )
+        result["pose"] = pose["pose"]
+        return result
+
+    def camera_question(message: str) -> bool:
+        normalized = message.lower().strip()
+        if re.search(r"\b(?:do not|don't|never)\s+(?:look|check|analy[sz]e|describe)\b", normalized):
+            return False
+        return bool(
+            re.search(
+                r"\b(?:what (?:do|can) you see|"
+                r"what(?:'s| is) (?:in front of you|in (?:the )?(?:camera|image|picture))|"
+                r"(?:look at|check|analy[sz]e|describe) (?:the |your )?"
+                r"(?:camera|view|image|picture|scene))\b",
+                normalized,
+            )
+        )
+
+    def color_detection_request(message: str) -> bool:
+        normalized = message.lower()
+        return bool(
+            re.search(
+                r"\b(?:colou?r (?:detection|detector|recognition|analysis)|"
+                r"detect (?:the )?colou?rs?)\b",
+                normalized,
+            )
+        )
+
+    def camera_reply(scene: Dict[str, Any]) -> str:
+        objects = scene.get("objects", [])
+        if not objects:
+            return "I don't detect any red, green, blue, or yellow objects in the camera view."
+        descriptions = []
+        for item in objects:
+            count = int(item["count"])
+            description = str(item["label"])
+            descriptions.append(
+                f"{count} {description}s" if count != 1 else f"a {description}"
+            )
+        if len(descriptions) == 1:
+            visible = descriptions[0]
+        else:
+            visible = ", ".join(descriptions[:-1]) + f" and {descriptions[-1]}"
+        return f"I can see {visible}."
+
+    def chat_action_name(message: str) -> Optional[str]:
+        """Recognize only explicit, non-negated conversational gesture requests."""
+        normalized = message.lower()
+        if re.search(r"\b(?:do not|don't|never)\s+(?:please\s+)?(?:nod|shake)\b", normalized):
+            return None
+        requested = set(
+            re.findall(
+                r"(?:^\s*(?:hibot[,:]?\s*)?|\bplease\s+|\b(?:can|could|would|will)\s+you\s+)(nod|shake)\b",
+                normalized,
+            )
+        )
+        return requested.pop() if len(requested) == 1 else None
+
+    def chat_reply(data: Dict[str, Any]) -> Dict[str, Any]:
         message = data.get("message")
         if not isinstance(message, str) or not message.strip():
             raise ValidationError("message must be a non-empty string")
         message = message.strip()
         if len(message) > 4000:
             raise ValidationError("message must be at most 4000 characters")
-        return {"text": chat_service.reply(message)}
+        if camera_question(message) or color_detection_request(message):
+            if color_detection_request(message):
+                scene = analyze_color_camera({"samples": 3})
+                return {"text": camera_reply(scene), "vision": scene}
+            scene = analyze_hermes_camera({})
+            text = str(scene.get("description") or "").strip()
+            if not text:
+                labels = [str(item["label"]) for item in scene.get("objects", [])]
+                text = "I can see " + ", ".join(labels) + "." if labels else "I could not identify any objects."
+            return {"text": text, "vision": scene}
+        result: Dict[str, Any] = {"text": chat_service.reply(message)}
+        action_name = chat_action_name(message)
+        if action_name == "nod":
+            action_result = robot.nod()
+        elif action_name == "shake":
+            action_result = robot.shake()
+        else:
+            return result
+        result["action"] = {"name": action_name, "result": action_result}
+        return result
+
+    def agent_servo(data: Dict[str, Any]) -> Dict[str, Any]:
+        servo_id = data.get("servo_id")
+        if servo_id not in (1, 3, 4, 5, 6):
+            raise ValidationError("servo_id must be one of: 1, 3, 4, 5, or 6")
+        return robot.servo(servo_id, data.get("pulse"), data.get("duration", 0.5))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MasterPiControl/0.1"
@@ -179,6 +302,12 @@ def make_handler(
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
+            if path.startswith("/api/agent/") and self.client_address[0] not in {"127.0.0.1", "::1"}:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"ok": False, "error": "Agent control is available only from localhost"},
+                )
+                return
             try:
                 if path == "/api/chat/audio":
                     audio, content_type = self._read_audio()
@@ -217,6 +346,9 @@ def make_handler(
                         d.get("duration", 1.0),
                     ),
                     "/api/home": lambda d: robot.home(d.get("duration", 1.5)),
+                    "/api/pose/check_front": lambda d: robot.check_front(
+                        d.get("duration", 0.8)
+                    ),
                     "/api/gesture/nod": lambda d: robot.nod(),
                     "/api/gesture/shake": lambda d: robot.shake(),
                     "/api/servo": lambda d: robot.servo(
@@ -225,12 +357,45 @@ def make_handler(
                     "/api/gripper": lambda d: robot.gripper(
                         d.get("opened"), d.get("duration", 0.5)
                     ),
+                    "/api/grab": recognize_and_grab,
+                    "/api/camera/analyze": analyze_hermes_camera,
+                    "/api/camera/analyze/color": analyze_color_camera,
                     "/api/rgb": lambda d: robot.rgb(d.get("red"), d.get("green"), d.get("blue")),
                     "/api/sonar/rgb": lambda d: robot.sonar_rgb(
                         d.get("red"), d.get("green"), d.get("blue")
                     ),
                     "/api/voice/speak": lambda d: robot.voice_speak(d.get("phrase")),
                     "/api/buzzer": lambda d: robot.buzzer(
+                        d.get("frequency", 1900),
+                        d.get("on_time", 0.1),
+                        d.get("off_time", 0.1),
+                        d.get("repeat", 1),
+                    ),
+                    "/api/agent/state": lambda d: robot.snapshot(),
+                    "/api/agent/drive_for": lambda d: robot.drive_for(
+                        d.get("direction"), d.get("speed"), d.get("duration")
+                    ),
+                    "/api/agent/avoid_obstacles": lambda d: robot.avoid_obstacles(
+                        d.get("duration"), d.get("speed", 20), d.get("clearance_cm", 30)
+                    ),
+                    "/api/agent/stop": lambda d: robot.stop(),
+                    "/api/agent/home": lambda d: robot.home(d.get("duration", 1.5)),
+                    "/api/agent/nod": lambda d: robot.nod(),
+                    "/api/agent/shake": lambda d: robot.shake(),
+                    "/api/agent/servo": agent_servo,
+                    "/api/agent/gripper": lambda d: robot.gripper(
+                        d.get("opened"), d.get("duration", 0.5)
+                    ),
+                    "/api/agent/grab": agent_grab,
+                    "/api/agent/camera_analyze": analyze_hermes_camera,
+                    "/api/agent/camera_analyze_color": analyze_color_camera,
+                    "/api/agent/rgb": lambda d: robot.rgb(
+                        d.get("red"), d.get("green"), d.get("blue")
+                    ),
+                    "/api/agent/sonar_rgb": lambda d: robot.sonar_rgb(
+                        d.get("red"), d.get("green"), d.get("blue")
+                    ),
+                    "/api/agent/buzzer": lambda d: robot.buzzer(
                         d.get("frequency", 1900),
                         d.get("on_time", 0.1),
                         d.get("off_time", 0.1),
@@ -245,6 +410,11 @@ def make_handler(
                 self._send_json(HTTPStatus.OK, {"ok": True, "result": result})
             except ValidationError as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            except CameraUnavailable as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
             except ValueError as exc:
                 self._send_json(
                     HTTPStatus.UNPROCESSABLE_ENTITY,

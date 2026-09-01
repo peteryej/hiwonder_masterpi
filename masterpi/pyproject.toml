@@ -17,6 +17,7 @@ dependencies = [
   "pyserial>=3.5",
   "PyYAML>=6.0",
   "smbus2>=0.4.3",
+  "mcp>=1.22,<2",
 ]
 
 [project.scripts]

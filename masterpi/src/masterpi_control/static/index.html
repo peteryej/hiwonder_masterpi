@@ -39,6 +39,7 @@
     .chat-message { width: fit-content; max-width: 85%; margin: 0; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     .chat-message.user { justify-self: end; background: #294fae; }
     .chat-message.hibot { justify-self: start; background: #263748; }
+    .chat-vision-image { display: block; max-width: min(100%, 640px); height: auto; justify-self: start; border: 1px solid #445268; border-radius: 10px; }
     .chat-compose { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; margin-top: 12px; }
     .chat-compose input { min-width: 0; border: 1px solid #455268; border-radius: 8px; padding: 10px; background: #0f1722; color: #fff; }
     #recordAudio { min-width: 48px; font-size: 1.25rem; line-height: 1; }
@@ -79,6 +80,9 @@
     .axis-guide dd { margin: 0; color: #b9c5d4; }
     .arm-status { min-height: 34px; margin-top: 12px; padding: 8px 10px; border-radius: 8px; background: #182c24; color: #88edb5; font-size: .86rem; }
     .arm-status.error { background: #351e24; color: #ff9daa; }
+    .servo-controls { display: grid; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #2d3948; }
+    .servo-control { display: grid; grid-template-columns: minmax(108px, .7fr) 1fr auto; gap: 9px; align-items: center; color: #b9c5d4; font-size: .88rem; }
+    .servo-control output { min-width: 4ch; color: #edf2f7; font-variant-numeric: tabular-nums; text-align: right; }
     #status { min-height: 28px; padding: 7px 10px; margin: 14px 0; border-radius: 8px; background: #182c24; color: #88edb5; }
     #status.error { background: #351e24; color: #ff9daa; }
     kbd { background: #303b4b; border-radius: 4px; padding: 2px 5px; }
@@ -151,8 +155,8 @@
           <h3>Quick arm controls</h3>
           <div class="quick-controls">
             <button id="quickHome" class="secondary">Home</button>
-            <button class="quick-arm-preset secondary" data-x="-5" data-y="14" data-z="20" data-pitch="0">Left</button>
-            <button class="quick-arm-preset secondary" data-x="5" data-y="14" data-z="20" data-pitch="0">Right</button>
+            <button id="quickCheckFront" class="secondary">Check front</button>
+            <button id="quickGrab">Grab object</button>
             <button id="quickOpen" class="secondary">Open gripper</button>
             <button id="quickClose" class="secondary">Close gripper</button>
             <button id="quickNod" class="secondary">Nod</button>
@@ -183,7 +187,7 @@
       <h2>LEDs and buzzer</h2>
       <label>Both expansion-board LEDs<input id="color" type="color" value="#3769e8"></label>
       <div class="row"><button id="setColor">Set color</button><button id="lightsOff" class="secondary">Off</button></div>
-      <label style="margin-top:16px">Both ultrasonic LEDs<input id="sonarColor" type="color" value="#00aaff"></label>
+      <label style="margin-top:16px">Both ultrasonic LEDs<input id="sonarColor" type="color" value="#000000"></label>
       <div class="row"><button id="setSonarColor">Set sensor color</button><button id="sonarLightsOff" class="secondary">Off</button></div>
       <div class="row"><button id="beep" class="secondary">Beep</button></div>
     </section>
@@ -207,13 +211,16 @@
         <label>Seconds<input id="armDuration" type="number" value="1" min="0.02" max="30" step="0.1"></label>
       </div>
       <div class="row"><button id="moveArm">Move arm</button><button id="home" class="secondary">Home</button></div>
-      <div class="row">
-        <button class="arm-preset secondary" data-x="-5" data-y="14" data-z="20" data-pitch="0">Left</button>
-        <button class="arm-preset secondary" data-x="5" data-y="14" data-z="20" data-pitch="0">Right</button>
-        <button class="arm-preset secondary" data-x="0" data-y="20" data-z="14" data-pitch="0">Extended</button>
-        <button class="arm-preset secondary" data-x="0" data-y="10" data-z="21" data-pitch="0">Up</button>
-      </div>
       <div class="row"><button id="open" class="secondary">Open gripper</button><button id="close" class="secondary">Close gripper</button></div>
+      <div class="servo-controls" aria-label="Direct servo control">
+        <strong>Direct servo control</strong>
+        <small>Move one slider, then release it to send a 0.5-second movement.</small>
+        <label class="servo-control">Servo 1 (gripper)<input id="servo1" class="servo-slider" data-servo-id="1" type="range" min="500" max="2500" value="1500" step="10"><output for="servo1">1500</output></label>
+        <label class="servo-control">Servo 3 (top)<input id="servo3" class="servo-slider" data-servo-id="3" type="range" min="500" max="2500" value="1500" step="10"><output for="servo3">1500</output></label>
+        <label class="servo-control">Servo 4<input id="servo4" class="servo-slider" data-servo-id="4" type="range" min="500" max="2500" value="1500" step="10"><output for="servo4">1500</output></label>
+        <label class="servo-control">Servo 5<input id="servo5" class="servo-slider" data-servo-id="5" type="range" min="500" max="2500" value="1500" step="10"><output for="servo5">1500</output></label>
+        <label class="servo-control">Servo 6 (base)<input id="servo6" class="servo-slider" data-servo-id="6" type="range" min="500" max="2500" value="1500" step="10"><output for="servo6">1500</output></label>
+      </div>
       <div id="armStatus" class="arm-status" role="status" aria-live="polite">Ready for an arm command.</div>
     </section>
   </div>
@@ -278,6 +285,14 @@
     chatMessages.append(message);
     chatMessages.scrollTop = chatMessages.scrollHeight;
   }
+  function addChatImage(src, alt='Detected objects with bounding boxes') {
+    const image = document.createElement('img');
+    image.className = 'chat-vision-image';
+    image.src = src;
+    image.alt = alt;
+    chatMessages.append(image);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
   async function speakReply(text) {
     if (!speakReplies.checked) return;
     const response = await fetch('/api/chat/tts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
@@ -312,6 +327,8 @@
     if (!response.ok || !body.ok) throw new Error(body.error || 'Chat request failed');
     if (body.transcript) addChatMessage('user', body.transcript);
     addChatMessage('hibot', body.result.text);
+    if (body.result.vision?.annotated_image) addChatImage(body.result.vision.annotated_image);
+    if (body.result.action) addChatMessage('hibot', `Action completed: ${body.result.action.name}.`);
     await speakReply(body.result.text);
   }
   async function sendChatMessage() {
@@ -517,22 +534,40 @@
   }
   document.querySelector('#home').onclick = homeArm;
   document.querySelector('#quickHome').onclick = homeArm;
-  document.querySelectorAll('.arm-preset, .quick-arm-preset').forEach(button => {
-    button.onclick = () => {
-      document.querySelector('#x').value = button.dataset.x;
-      document.querySelector('#y').value = button.dataset.y;
-      document.querySelector('#z').value = button.dataset.z;
-      document.querySelector('#pitch').value = button.dataset.pitch;
-      document.querySelector('#armDuration').value = 1.5;
-      moveArm();
-    };
-  });
+  document.querySelector('#quickCheckFront').onclick = () =>
+    sendArmCommand('pose/check_front', {duration:0.8}, 'Arm moved to the Check front pose.');
+  const quickGrab = document.querySelector('#quickGrab');
+  quickGrab.onclick = async () => {
+    quickGrab.disabled = true;
+    setArmStatus('Grabbing the object directly in front…');
+    try {
+      await api('grab', {force:true});
+      setArmStatus('Grab completed and arm returned Home.');
+    } catch (error) {
+      setArmStatus(error.message, true);
+    } finally {
+      quickGrab.disabled = false;
+    }
+  };
   document.querySelector('#open').onclick = () => api('gripper', {opened:true});
   document.querySelector('#close').onclick = () => api('gripper', {opened:false});
   document.querySelector('#quickOpen').onclick = () => api('gripper', {opened:true});
   document.querySelector('#quickClose').onclick = () => api('gripper', {opened:false});
   document.querySelector('#quickNod').onclick = () => sendArmCommand('gesture/nod', {}, 'Nod completed.');
   document.querySelector('#quickShake').onclick = () => sendArmCommand('gesture/shake', {}, 'Shake completed.');
+  document.querySelectorAll('.servo-slider').forEach(slider => {
+    const output = document.querySelector(`output[for="${slider.id}"]`);
+    slider.addEventListener('input', () => { output.value = slider.value; output.textContent = slider.value; });
+    slider.addEventListener('change', async () => {
+      setArmStatus(`Moving servo ${slider.dataset.servoId}…`);
+      try {
+        await api('servo', {servo_id:+slider.dataset.servoId, pulse:+slider.value, duration:0.5});
+        setArmStatus(`Servo ${slider.dataset.servoId} moved to pulse ${slider.value}.`);
+      } catch (error) {
+        setArmStatus(error.message, true);
+      }
+    });
+  });
   function colorValue() { const value=document.querySelector('#color').value; return {red:parseInt(value.slice(1,3),16), green:parseInt(value.slice(3,5),16), blue:parseInt(value.slice(5,7),16)}; }
   document.querySelector('#setColor').onclick = () => api('rgb', colorValue());
   document.querySelector('#lightsOff').onclick = () => api('rgb', {red:0,green:0,blue:0});

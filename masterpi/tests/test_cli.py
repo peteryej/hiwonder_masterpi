@@ -4,6 +4,11 @@ from masterpi_control.cli import _parser
 
 
 class CliTests(unittest.TestCase):
+    def test_grab_accepts_supported_target_colors(self):
+        args = _parser().parse_args(["grab", "green"])
+        self.assertEqual(args.command, "grab")
+        self.assertEqual(args.target, "green")
+
     def test_serve_accepts_https_certificate_options(self):
         args = _parser().parse_args(
             [

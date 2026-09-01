@@ -10,8 +10,10 @@ import time
 from typing import Any, Optional, Sequence
 
 from .backends import BackendUnavailable, MockBackend, VendorBackend
+from .camera import CameraStream, CameraUnavailable
 from .robot import Robot, RobotError, ValidationError
 from .server import serve
+from .vision import SUPPORTED_COLORS, VisionGrasper
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -56,6 +58,9 @@ def _parser() -> argparse.ArgumentParser:
     gripper = sub.add_parser("gripper", help="open or close the gripper")
     gripper.add_argument("position", choices=("open", "close"))
     gripper.add_argument("--seconds", type=float, default=0.5)
+
+    grab = sub.add_parser("grab", help="recognize and grab a centered colored object")
+    grab.add_argument("target", nargs="?", default="any", choices=("any", *SUPPORTED_COLORS))
 
     rgb = sub.add_parser("rgb", help="set both expansion-board RGB LEDs")
     rgb.add_argument("red", type=int)
@@ -132,6 +137,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = robot.servo(args.servo_id, args.pulse, args.seconds)
         elif args.command == "gripper":
             result = robot.gripper(args.position == "open", args.seconds)
+        elif args.command == "grab":
+            camera = CameraStream()
+            try:
+                result = VisionGrasper(robot, camera).recognize_and_grab(args.target)
+            finally:
+                camera.close()
         elif args.command == "rgb":
             result = robot.rgb(args.red, args.green, args.blue)
         elif args.command == "buzzer":
@@ -142,10 +153,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
-    except (BackendUnavailable, RobotError, ValidationError, ValueError, OSError) as exc:
+    except (BackendUnavailable, CameraUnavailable, RobotError, ValidationError, ValueError, OSError) as exc:
         print(f"masterpi: {exc}", file=sys.stderr)
         return 2
     finally:
         if robot is not None:
             robot.close()
-

@@ -8,7 +8,10 @@ The browser also includes a hibot chat panel directly below the chassis. It
 accepts typed messages and microphone recordings, keeps a named Hermes Agent
 conversation, displays text replies, and can read replies aloud through the
 browser. Chat runs with Hermes' restricted `safe` toolset because this server
-has no login.
+has no login. The web server separately recognizes explicit, non-negated chat
+requests for the allowlisted **Nod** and **Shake** gestures (for example,
+“nod if you understand”), executes the validated robot gesture, and shows the
+completed action in the chat log. Other chat text remains text-only.
 
 The implementation follows both generations of Hiwonder's Python API:
 
@@ -87,6 +90,15 @@ export MASTERPI_CAMERA_DEVICE=/dev/video1
 .venv/bin/masterpi serve
 ```
 
+The **Grab object** quick-arm action immediately closes the gripper at the
+fixed front pickup coordinate and returns the arm to Home while holding the
+object. It intentionally performs no camera, color, stability, or centering
+check; place the object directly in front of the gripper before selecting it.
+
+The **Check front** quick-arm preset moves servo 3 to `500`, servo 4 to `2500`,
+servo 5 to `1350`, and servo 6 to `1500` over 0.8 seconds. It leaves the
+gripper on servo 1 unchanged.
+
 The chat panel requires the `hermes` command and a configured Hermes model.
 Recorded messages use Hermes' configured speech-to-text provider. On browsers
 that block microphone access from a plain HTTP robot address, use HTTPS or
@@ -107,7 +119,8 @@ on each browser device.
 
 The ultrasonic-distance card polls the Hiwonder I²C sensor at address `0x77`
 and displays centimetres. Its color picker controls both RGB LEDs on the
-sensor. Enable Raspberry Pi I²C before using it:
+sensor. Both ultrasonic LEDs are turned off whenever the controller starts.
+Enable Raspberry Pi I²C before using it:
 
 ```bash
 sudo raspi-config nonint do_i2c 0
@@ -155,6 +168,9 @@ backward; intermediate angles produce diagonal mecanum motion. Linear speed is
 .venv/bin/masterpi home
 .venv/bin/masterpi gripper open
 
+# Recognize and pick up a centered colored object (or specify red/green/blue/yellow).
+.venv/bin/masterpi grab any
+
 # Move the arm endpoint to x=5, y=8, z=16 cm.
 .venv/bin/masterpi arm 5 8 16 --pitch 0 --seconds 1.2
 
@@ -192,8 +208,32 @@ object, including `/api/stop`.
 | `POST /api/home` | `{}` |
 | `POST /api/servo` | `{"servo_id":1,"pulse":1500,"duration":0.5}` |
 | `POST /api/gripper` | `{"opened":true}` |
+| `POST /api/grab` | `{"target":"red"}` |
+| `POST /api/camera/analyze` | `{}` (Check front + Hermes vision) |
+| `POST /api/camera/analyze/color` | `{"samples":3}` |
 | `POST /api/rgb` | `{"red":255,"green":0,"blue":0}` |
 | `POST /api/buzzer` | `{"frequency":1900,"on_time":0.1,"off_time":0.1,"repeat":1}` |
+
+`grab` recognizes red, green, blue, and yellow regions in three consecutive
+camera frames. It only moves the arm when one color is stable and the object is
+near the image center, then uses the fixed table-height capture coordinate from
+Hiwonder's color-sorting lesson. It does not identify arbitrary semantic object
+classes, estimate depth, or drive the chassis. Start with a lightweight block,
+keep the pickup area clear, and tune the fixed coordinate for your camera mount
+and table height before trying fragile objects.
+
+The Hermes/MCP agent `recognize_and_grab` action intentionally bypasses camera
+and color checks. Like the webpage's Quick Arm action, it always executes the
+fixed front pickup and returns Home while holding the object.
+
+The chat understands camera questions such as **“What do you see?”**, **“What
+is in the camera?”**, and **“Describe the scene.”** By default it moves to the
+Check front pose, waits for the arm, captures a fresh frame, and asks Hermes
+vision for semantic object labels and normalized bounding boxes. The server
+draws those boxes and labels on the captured frame and includes the annotated
+image directly in the chat reply. Local OpenCV
+color-region detection is used only when the request explicitly says **color
+detection**, **color recognition**, or **detect colors**.
 
 ## Development and tests
 

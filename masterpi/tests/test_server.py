@@ -5,20 +5,36 @@ from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
+import cv2
+import numpy as np
+
 from masterpi_control.backends import MockBackend
 from masterpi_control.robot import Robot
 from masterpi_control.server import make_handler
 
 
 class FakeCamera:
+    def __init__(self):
+        image = np.zeros((120, 160, 3), dtype=np.uint8)
+        cv2.rectangle(image, (32, 12), (96, 108), (255, 255, 255), -1)
+        ok, encoded = cv2.imencode(".jpg", image)
+        assert ok
+        self.analysis_frame = encoded.tobytes()
+        self.sequence = 0
+
     def frames(self):
         yield b"\xff\xd8camera-frame\xff\xd9"
+
+    def next_frame(self, after=0, timeout=3.0):
+        self.sequence += 1
+        return self.sequence, self.analysis_frame
 
 
 class FakeChat:
     def __init__(self):
         self.messages = []
         self.audio = []
+        self.images = []
 
     def reply(self, message):
         self.messages.append(message)
@@ -31,15 +47,63 @@ class FakeChat:
     def synthesize(self, text):
         return b"fake-mp3-audio", "audio/mpeg"
 
+    def analyze_image(self, jpeg):
+        self.images.append(jpeg)
+        return {
+            "description": "A bottle is in front of the robot.",
+            "objects": [
+                {
+                    "label": "bottle",
+                    "confidence": 0.92,
+                    "bbox": {"x_min": 0.2, "y_min": 0.1, "x_max": 0.6, "y_max": 0.9},
+                }
+            ],
+            "object_count": 1,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-terra",
+        }
+
+
+class FakeVisionGrasper:
+    def __init__(self):
+        self.targets = []
+        self.analysis_calls = []
+
+    def recognize_and_grab(self, target):
+        self.targets.append(target)
+        return {"grabbed": True, "detection": {"color": target}}
+
+    def grab_front(self):
+        return {"grabbed": True, "mode": "fixed front pickup", "returned_home": True}
+
+    def analyze_scene(self, samples=3):
+        self.analysis_calls.append(samples)
+        return {
+            "objects": [
+                {"label": "red object", "color": "red", "count": 1},
+                {"label": "blue object", "color": "blue", "count": 2},
+            ],
+            "object_count": 3,
+            "samples": samples,
+            "recognizer": "color regions",
+        }
+
 
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.robot = Robot(MockBackend(), watchdog_timeout=0.3)
         self.camera = FakeCamera()
         self.chat = FakeChat()
+        self.vision_grasper = FakeVisionGrasper()
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            make_handler(self.robot, self.camera, self.chat, b"test-masterpi-ca"),
+            make_handler(
+                self.robot,
+                self.camera,
+                self.chat,
+                b"test-masterpi-ca",
+                self.vision_grasper,
+            ),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -86,6 +150,7 @@ class ServerTests(unittest.TestCase):
         self.assertLess(page.find(b'id="toggleCamera"'), page.find(b'id="cameraShell"'))
         self.assertIn(b'id="distanceValue"', page)
         self.assertIn(b'id="sonarColor"', page)
+        self.assertIn(b'id="sonarColor" type="color" value="#000000"', page)
         self.assertIn(b'class="control-card"', page)
         self.assertIn(b'class="control-layout"', page)
         self.assertIn(b'class="control-panel sensor-panel"', page)
@@ -102,27 +167,41 @@ class ServerTests(unittest.TestCase):
         self.assertLess(page.find(b'class="pad"'), page.find(b'id="quickHome"'))
         self.assertLess(page.find(b'id="quickClose"'), page.find(b'id="sonarColor"'))
         self.assertIn(b'id="quickHome"', page)
+        self.assertIn(b'id="quickCheckFront"', page)
+        self.assertIn(b'id="quickGrab"', page)
         self.assertIn(b'id="quickOpen"', page)
         self.assertIn(b'id="quickClose"', page)
         self.assertIn(b'id="quickNod"', page)
         self.assertIn(b'id="quickShake"', page)
         self.assertIn(b"'gesture/nod'", page)
         self.assertIn(b"'gesture/shake'", page)
-        self.assertEqual(page.count(b'class="quick-arm-preset secondary"'), 2)
+        self.assertIn(b"api('grab', {force:true})", page)
+        self.assertIn(b"'pose/check_front'", page)
+        self.assertIn(b"arm returned Home", page)
+        self.assertEqual(page.count(b'class="quick-arm-preset secondary"'), 0)
         self.assertNotIn(b"WonderEcho voice", page)
         self.assertNotIn(b'id="voiceDetected"', page)
         self.assertNotIn(b'id="voicePhrase"', page)
         self.assertNotIn(b'id="speakVoice"', page)
         self.assertNotIn(b"/api/voice", page)
         self.assertNotIn(b"Reconnect camera", page)
-        self.assertNotIn(b"Direct servo control", page)
-        self.assertNotIn(b'id="setServo"', page)
+        self.assertIn(b"Direct servo control", page)
+        self.assertEqual(page.count(b'class="servo-slider"'), 5)
+        for servo_id in (1, 3, 4, 5, 6):
+            self.assertIn(f'id="servo{servo_id}"'.encode(), page)
+        self.assertNotIn(b'id="servo2"', page)
+        self.assertNotIn(b"Arm servo", page)
+        self.assertLess(page.find(b"Servo 1 (gripper)"), page.find(b"Servo 3 (top)"))
+        self.assertLess(page.find(b"Servo 3 (top)"), page.find(b"Servo 4"))
+        self.assertLess(page.find(b"Servo 4"), page.find(b"Servo 5"))
+        self.assertLess(page.find(b"Servo 5"), page.find(b"Servo 6 (base)"))
+        self.assertIn(b"api('servo'", page)
         self.assertIn(b"Target position of the gripper tip", page)
         self.assertIn(b"positive moves right", page)
         self.assertNotIn(b"Accepted limits:", page)
         self.assertGreater(page.find(b"Arm position (cm)"), page.find(b"LEDs and buzzer"))
         self.assertIn(b'id="armStatus"', page)
-        self.assertEqual(page.count(b'class="arm-preset secondary"'), 4)
+        self.assertEqual(page.count(b'class="arm-preset secondary"'), 0)
         status, payload = self.request("GET", "/api/state")
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(payload)["ok"])
@@ -160,6 +239,10 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b"primeReplyAudio", page)
         self.assertIn(b"decodeAudioData", page)
         self.assertIn(b"MediaRecorder", page)
+        self.assertIn(b"body.result.action", page)
+        self.assertIn(b"Action completed:", page)
+        self.assertIn(b"body.result.vision?.annotated_image", page)
+        self.assertIn(b"chat-vision-image", page)
 
     def test_text_chat_api_returns_hibot_reply(self):
         status, payload = self.request(
@@ -171,6 +254,74 @@ class ServerTests(unittest.TestCase):
             {"ok": True, "result": {"text": "hibot heard: How are you?"}},
         )
         self.assertEqual(self.chat.messages, ["How are you?"])
+
+    def test_chat_camera_question_analyzes_live_frames(self):
+        with patch("masterpi_control.server.time.sleep"):
+            status, payload = self.request("POST", "/api/chat", {"message": "What do you see?"})
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(result["text"], "A bottle is in front of the robot.")
+        self.assertEqual(result["vision"]["object_count"], 1)
+        self.assertEqual(result["vision"]["objects"][0]["label"], "bottle")
+        self.assertTrue(result["vision"]["annotated_image"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(self.vision_grasper.analysis_calls, [])
+        self.assertEqual(self.chat.images, [self.camera.analysis_frame])
+        self.assertEqual(self.chat.messages, [])
+        servo_events = [event for event in self.robot.backend.events if event["action"] == "servo"]
+        self.assertEqual(
+            [(event["servo_id"], event["pulse"]) for event in servo_events],
+            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+        )
+
+    def test_explicit_color_detection_uses_local_analyzer_without_pose(self):
+        before = len(self.robot.backend.events)
+        status, payload = self.request(
+            "POST", "/api/chat", {"message": "Use color detection; what do you see?"}
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(result["text"], "I can see a red object and 2 blue objects.")
+        self.assertEqual(self.vision_grasper.analysis_calls, [3])
+        self.assertEqual(self.chat.images, [])
+        self.assertEqual(len(self.robot.backend.events), before)
+
+    def test_color_analysis_api_is_read_only(self):
+        before = len(self.robot.backend.events)
+        status, payload = self.request(
+            "POST", "/api/camera/analyze/color", {"samples": 3}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["object_count"], 3)
+        self.assertEqual(len(self.robot.backend.events), before)
+
+    def test_chat_request_can_run_the_nod_gesture(self):
+        with patch("masterpi_control.robot.time.sleep"):
+            status, payload = self.request("POST", "/api/chat", {"message": "nod if you understand"})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload),
+            {
+                "ok": True,
+                "result": {
+                    "text": "hibot heard: nod if you understand",
+                    "action": {"name": "nod", "result": {"gesture": "nod", "cycles": 1}},
+                },
+            },
+        )
+        self.assertEqual(self.chat.messages, ["nod if you understand"])
+        self.assertEqual(
+            [(event["servo_id"], event["pulse"]) for event in self.robot.backend.events if event["action"] == "servo"],
+            [(3, 1028), (3, 500)],
+        )
+
+    def test_negated_chat_gesture_request_remains_text_only(self):
+        status, payload = self.request("POST", "/api/chat", {"message": "Please do not nod"})
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload),
+            {"ok": True, "result": {"text": "hibot heard: Please do not nod"}},
+        )
+        self.assertFalse(any(event["action"] == "servo" for event in self.robot.backend.events))
 
     def test_chat_tts_api_returns_playable_audio(self):
         status, payload, content_type = self.raw_request_with_type(
@@ -248,6 +399,28 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(json.loads(payload)["result"]["spoken_text"], "Going forward")
         self.assertEqual(self.robot.backend.events[-1]["action"], "voice_speak")
 
+    def test_agent_routes_expose_only_bounded_motion_and_tools(self):
+        status, payload = self.request(
+            "POST", "/api/agent/drive_for", {"direction": "forward", "speed": 20, "duration": 0.05}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["direction"], "forward")
+        self.assertEqual(self.robot.snapshot()["drive"]["speed"], 0.0)
+
+        self.robot.backend.mock_distance_mm = 200
+        with patch("masterpi_control.robot.time.sleep"):
+            status, payload = self.request(
+                "POST", "/api/agent/avoid_obstacles", {"duration": 0.1, "speed": 20, "clearance_cm": 30}
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["obstacles_avoided"], 1)
+
+        status, payload = self.request(
+            "POST", "/api/agent/servo", {"servo_id": 2, "pulse": 1500, "duration": 0.5}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("1, 3, 4, 5, or 6", json.loads(payload)["error"])
+
     def test_drive_and_stop_api(self):
         status, payload = self.request(
             "POST", "/api/drive", {"speed": 35, "direction": 90, "angular_rate": 0}
@@ -258,11 +431,43 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.robot.snapshot()["drive"]["speed"], 0.0)
 
+    def test_check_front_pose_api_uses_exact_servo_targets(self):
+        status, payload = self.request(
+            "POST", "/api/pose/check_front", {"duration": 0.8}
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(
+            [(item["servo_id"], item["pulse"]) for item in result["servos"]],
+            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+        )
+
+    def test_camera_guided_grab_api(self):
+        status, payload = self.request("POST", "/api/grab", {"target": "blue"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["result"]["grabbed"])
+        self.assertEqual(self.vision_grasper.targets, ["blue"])
+
+        status, payload = self.request("POST", "/api/agent/grab", {"target": "red"})
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(result["mode"], "fixed front pickup")
+        self.assertTrue(result["returned_home"])
+        self.assertEqual(self.vision_grasper.targets, ["blue"])
+
+    def test_forced_front_grab_skips_recognition(self):
+        status, payload = self.request("POST", "/api/grab", {"force": True})
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertTrue(result["grabbed"])
+        self.assertEqual(result["mode"], "fixed front pickup")
+        self.assertEqual(self.vision_grasper.targets, [])
+
     def test_nod_gesture_api(self):
         with patch("masterpi_control.robot.time.sleep"):
             status, payload = self.request("POST", "/api/gesture/nod", {})
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(payload)["result"], {"gesture": "nod", "cycles": 2})
+        self.assertEqual(json.loads(payload)["result"], {"gesture": "nod", "cycles": 1})
 
     def test_shake_gesture_api(self):
         with patch("masterpi_control.robot.time.sleep"):

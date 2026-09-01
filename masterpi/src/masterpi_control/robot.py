@@ -81,6 +81,7 @@ class Robot:
         self.watchdog_timeout = _number("watchdog_timeout", watchdog_timeout, 0.1, 10.0)
         self._lock = threading.RLock()
         self._gesture_lock = threading.Lock()
+        self._drive_lock = threading.Lock()
         self._closed = threading.Event()
         self._moving = False
         self._last_drive = time.monotonic()
@@ -108,6 +109,12 @@ class Robot:
         # state before accepting commands or starting the watchdog.
         self.backend.stop()
         self._last_chassis_stop = time.monotonic()
+        try:
+            self.backend.sonar_rgb(0, 0, 0)
+        except Exception as exc:
+            # The ultrasonic sensor is optional; a missing I2C device must not
+            # prevent chassis and arm control from starting.
+            self._state["last_error"] = f"initial sonar LED reset failed: {exc}"
         self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watchdog.start()
         self._button_listener = threading.Thread(target=self._button_loop, daemon=True)
@@ -143,6 +150,72 @@ class Robot:
             self._moving = False
             self._state["drive"] = command
         return command
+
+    def _run_drive_for(self, speed: float, direction: float, angular_rate: float, duration: float) -> None:
+        """Refresh the dead-man watchdog during a finite chassis movement."""
+        deadline = time.monotonic() + duration
+        try:
+            while time.monotonic() < deadline:
+                self.drive(speed, direction, angular_rate)
+                time.sleep(min(0.15, max(0.01, deadline - time.monotonic())))
+        finally:
+            self.stop()
+
+    def drive_for(self, direction: Any, speed: Any, duration: Any) -> Dict[str, Any]:
+        """Drive in a named direction for a finite, watchdog-refreshed interval."""
+        if not isinstance(direction, str):
+            raise ValidationError("direction must be forward, backward, left, right, rotate_left, or rotate_right")
+        directions = {
+            "forward": (90.0, 0.0),
+            "backward": (270.0, 0.0),
+            "left": (180.0, 0.0),
+            "right": (0.0, 0.0),
+            "rotate_left": (0.0, -1.0),
+            "rotate_right": (0.0, 1.0),
+        }
+        key = direction.strip().lower()
+        motion = directions.get(key)
+        if motion is None:
+            raise ValidationError("direction must be forward, backward, left, right, rotate_left, or rotate_right")
+        speed_value = _number("speed", speed, 1, 35)
+        duration_value = _number("duration", duration, 0.05, 8)
+        with self._drive_lock:
+            self._run_drive_for(speed_value, motion[0], motion[1], duration_value)
+        return {"direction": key, "speed": speed_value, "duration": duration_value}
+
+    def avoid_obstacles(self, duration: Any, speed: Any = 20, clearance_cm: Any = 30) -> Dict[str, Any]:
+        """Move forward briefly, stopping and turning right at an ultrasonic obstacle.
+
+        This is reactive obstacle avoidance, not mapping, localization, or
+        distance-accurate navigation: the chassis has no verified odometry.
+        """
+        duration_value = _number("duration", duration, 0.1, 8)
+        speed_value = _number("speed", speed, 5, 25)
+        clearance_value = _number("clearance_cm", clearance_cm, 15, 80)
+        obstacles_avoided = 0
+        deadline = time.monotonic() + duration_value
+        with self._drive_lock:
+            try:
+                while time.monotonic() < deadline:
+                    reading = self.distance()
+                    if reading["centimeters"] < clearance_value:
+                        obstacles_avoided += 1
+                        self.stop()
+                        # A short, bounded turn is the only safe response we
+                        # can make with a single forward-facing range sensor.
+                        self._run_drive_for(speed_value, 0.0, 1.0, 0.5)
+                        break
+                    self.drive(speed_value, 90.0, 0.0)
+                    time.sleep(min(0.15, max(0.01, deadline - time.monotonic())))
+            finally:
+                self.stop()
+        return {
+            "mode": "reactive_obstacle_avoidance",
+            "duration": duration_value,
+            "speed": speed_value,
+            "clearance_cm": clearance_value,
+            "obstacles_avoided": obstacles_avoided,
+        }
 
     def servo(self, servo_id: Any, pulse: Any, duration: Any = 0.5) -> Dict[str, Any]:
         servo_value = _integer("servo_id", servo_id, 1, 6)
@@ -185,24 +258,50 @@ class Robot:
     def home(self, duration: Any = 1.5) -> Dict[str, float]:
         return self.arm(0, 6, 18, 0, -90, 90, duration)
 
-    def nod(self) -> Dict[str, Any]:
-        """Nod twice by moving the gripper pitch at a known-safe arm pose."""
+    def check_front(self, duration: Any = 0.8) -> Dict[str, Any]:
+        """Move the arm servos to the user-defined forward-looking pose."""
+        duration_value = _number("duration", duration, 0.02, 30)
+        targets = ((3, 500), (4, 2500), (5, 1350), (6, 1500))
         with self._gesture_lock:
-            self.arm(0, 19, 12, 0, -90, 90, 0.8)
+            commands = [
+                self.servo(servo_id, pulse, duration_value)
+                for servo_id, pulse in targets
+            ]
+        return {
+            "pose": "check_front",
+            "duration": duration_value,
+            "servos": commands,
+        }
+
+    def nod(self) -> Dict[str, Any]:
+        """Move servo 3 through the safe nod range and return to Home."""
+        with self._gesture_lock:
+            self.home(0.8)
             time.sleep(0.82)
-            for pitch in (20, -20, 20, -20, 0):
-                self.arm(0, 19, 12, pitch, -90, 90, 0.35)
+            try:
+                # Servo 3 is 695 at the documented Home pose. A positive 30°
+                # offset is 1028 pulses; the negative offset is clamped to its
+                # validated 500-pulse mechanical minimum.
+                self.servo(3, 1028, 0.35)
                 time.sleep(0.37)
-        return {"gesture": "nod", "cycles": 2}
+                self.servo(3, 500, 0.35)
+                time.sleep(0.37)
+            finally:
+                self.home(0.8)
+        return {"gesture": "nod", "cycles": 1}
 
     def shake(self) -> Dict[str, Any]:
-        """Shake twice by moving the arm left and right, then recenter it."""
+        """Swing servo 6 twice through ±20° from Home, then return Home."""
         with self._gesture_lock:
-            self.arm(0, 14, 20, 0, -90, 90, 0.8)
+            self.home(0.8)
             time.sleep(0.82)
-            for x in (-5, 5, -5, 5, 0):
-                self.arm(x, 14, 20, 0, -90, 90, 0.35)
-                time.sleep(0.37)
+            try:
+                # Servo 6 is 1500 at Home; 20° is 222 pulses at 2000/180.
+                for pulse in (1722, 1278, 1722, 1278):
+                    self.servo(6, pulse, 0.35)
+                    time.sleep(0.37)
+            finally:
+                self.home(0.8)
         return {"gesture": "shake", "cycles": 2}
 
     def gripper(self, opened: Any, duration: Any = 0.5) -> Dict[str, Any]:
