@@ -89,12 +89,31 @@ class FakeVisionGrasper:
         }
 
 
+class FakeSoundTracker:
+    def __init__(self):
+        self.direction_calls = []
+        self.come_here_calls = []
+
+    def direction(self, samples=5):
+        self.direction_calls.append(samples)
+        return {"relative_angle": 42.0, "samples": samples, "voice_active": True}
+
+    def come_here(self, approach_duration=2.0, clearance_cm=45, samples=5):
+        self.come_here_calls.append((approach_duration, clearance_cm, samples))
+        return {
+            "mode": "sound_source_approach",
+            "bearing": {"relative_angle": 42.0},
+            "motion": {"stopped_for_obstacle": True},
+        }
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.robot = Robot(MockBackend(), watchdog_timeout=0.3)
         self.camera = FakeCamera()
         self.chat = FakeChat()
         self.vision_grasper = FakeVisionGrasper()
+        self.sound_tracker = FakeSoundTracker()
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
             make_handler(
@@ -103,6 +122,7 @@ class ServerTests(unittest.TestCase):
                 self.chat,
                 b"test-masterpi-ca",
                 self.vision_grasper,
+                self.sound_tracker,
             ),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -401,16 +421,20 @@ class ServerTests(unittest.TestCase):
 
     def test_agent_routes_expose_only_bounded_motion_and_tools(self):
         status, payload = self.request(
-            "POST", "/api/agent/drive_for", {"direction": "forward", "speed": 20, "duration": 0.05}
+            "POST", "/api/agent/drive_for", {"direction": "forward", "duration": 0.05}
         )
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(payload)["result"]["direction"], "forward")
+        drive_result = json.loads(payload)["result"]
+        self.assertEqual(drive_result["direction"], "forward")
+        self.assertEqual(drive_result["speed"], 40.0)
+        self.assertEqual(drive_result["heading"], 90.0)
+        self.assertEqual(drive_result["angular_rate"], 0.0)
         self.assertEqual(self.robot.snapshot()["drive"]["speed"], 0.0)
 
         self.robot.backend.mock_distance_mm = 200
         with patch("masterpi_control.robot.time.sleep"):
             status, payload = self.request(
-                "POST", "/api/agent/avoid_obstacles", {"duration": 0.1, "speed": 20, "clearance_cm": 30}
+                "POST", "/api/agent/avoid_obstacles", {"duration": 0.1, "speed": 40, "clearance_cm": 30}
             )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload)["result"]["obstacles_avoided"], 1)
@@ -420,6 +444,23 @@ class ServerTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("1, 3, 4, 5, or 6", json.loads(payload)["error"])
+
+    def test_agent_sound_direction_and_come_here_routes(self):
+        status, payload = self.request(
+            "POST", "/api/agent/sound_direction", {"samples": 7}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["relative_angle"], 42.0)
+        self.assertEqual(self.sound_tracker.direction_calls, [7])
+
+        status, payload = self.request(
+            "POST",
+            "/api/agent/come_here",
+            {"approach_duration": 1.5, "clearance_cm": 50, "samples": 6},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["mode"], "sound_source_approach")
+        self.assertEqual(self.sound_tracker.come_here_calls, [(1.5, 50, 6)])
 
     def test_drive_and_stop_api(self):
         status, payload = self.request(

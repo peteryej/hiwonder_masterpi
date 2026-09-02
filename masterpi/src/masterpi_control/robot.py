@@ -161,8 +161,10 @@ class Robot:
         finally:
             self.stop()
 
-    def drive_for(self, direction: Any, speed: Any, duration: Any) -> Dict[str, Any]:
-        """Drive in a named direction for a finite, watchdog-refreshed interval."""
+    def drive_for(
+        self, direction: Any, duration: Any = 1.0, speed: Any = 40
+    ) -> Dict[str, Any]:
+        """Drive like the web controls for a finite, watchdog-refreshed interval."""
         if not isinstance(direction, str):
             raise ValidationError("direction must be forward, backward, left, right, rotate_left, or rotate_right")
         directions = {
@@ -170,27 +172,40 @@ class Robot:
             "backward": (270.0, 0.0),
             "left": (180.0, 0.0),
             "right": (0.0, 0.0),
-            "rotate_left": (0.0, -1.0),
-            "rotate_right": (0.0, 1.0),
+            # Match the webpage turn controls exactly: rotation has no linear
+            # component, uses the forward heading placeholder, and yaws at
+            # +/-0.6 rather than mixing translation into the turn.
+            "rotate_left": (90.0, -0.6),
+            "rotate_right": (90.0, 0.6),
         }
         key = direction.strip().lower()
         motion = directions.get(key)
         if motion is None:
             raise ValidationError("direction must be forward, backward, left, right, rotate_left, or rotate_right")
-        speed_value = _number("speed", speed, 1, 35)
+        # The webpage's known-working default is 40 mm/s. Lower duties can be
+        # below the starting torque of some wheels, so agent motion rejects
+        # values below that threshold instead of energizing only one wheel.
+        speed_value = _number("speed", speed, 40, 100)
         duration_value = _number("duration", duration, 0.05, 8)
+        linear_speed = 0.0 if key.startswith("rotate_") else speed_value
         with self._drive_lock:
-            self._run_drive_for(speed_value, motion[0], motion[1], duration_value)
-        return {"direction": key, "speed": speed_value, "duration": duration_value}
+            self._run_drive_for(linear_speed, motion[0], motion[1], duration_value)
+        return {
+            "direction": key,
+            "speed": linear_speed,
+            "heading": motion[0],
+            "angular_rate": motion[1],
+            "duration": duration_value,
+        }
 
-    def avoid_obstacles(self, duration: Any, speed: Any = 20, clearance_cm: Any = 30) -> Dict[str, Any]:
+    def avoid_obstacles(self, duration: Any, speed: Any = 40, clearance_cm: Any = 30) -> Dict[str, Any]:
         """Move forward briefly, stopping and turning right at an ultrasonic obstacle.
 
         This is reactive obstacle avoidance, not mapping, localization, or
         distance-accurate navigation: the chassis has no verified odometry.
         """
         duration_value = _number("duration", duration, 0.1, 8)
-        speed_value = _number("speed", speed, 5, 25)
+        speed_value = _number("speed", speed, 40, 100)
         clearance_value = _number("clearance_cm", clearance_cm, 15, 80)
         obstacles_avoided = 0
         deadline = time.monotonic() + duration_value
@@ -203,7 +218,7 @@ class Robot:
                         self.stop()
                         # A short, bounded turn is the only safe response we
                         # can make with a single forward-facing range sensor.
-                        self._run_drive_for(speed_value, 0.0, 1.0, 0.5)
+                        self._run_drive_for(0.0, 90.0, 0.6, 0.5)
                         break
                     self.drive(speed_value, 90.0, 0.0)
                     time.sleep(min(0.15, max(0.01, deadline - time.monotonic())))
@@ -215,6 +230,53 @@ class Robot:
             "speed": speed_value,
             "clearance_cm": clearance_value,
             "obstacles_avoided": obstacles_avoided,
+        }
+
+    def approach_bearing(
+        self,
+        relative_angle: Any,
+        approach_duration: Any = 2.0,
+        clearance_cm: Any = 45,
+        speed: Any = 40,
+    ) -> Dict[str, Any]:
+        """Rotate toward a relative bearing, then approach until time or sonar limit."""
+        angle = _number("relative_angle", relative_angle, -180, 180)
+        duration = _number("approach_duration", approach_duration, 0.1, 3)
+        clearance = _number("clearance_cm", clearance_cm, 25, 100)
+        speed_value = _number("speed", speed, 40, 60)
+        turn_rate = 0.6
+        turn_duration = 0.0
+        stopped_for_obstacle = False
+        final_distance: Optional[float] = None
+        with self._drive_lock:
+            try:
+                if abs(angle) > 10:
+                    turn_duration = min(math.radians(abs(angle)) / turn_rate, 3.0)
+                    self._run_drive_for(
+                        0.0,
+                        90.0,
+                        turn_rate if angle > 0 else -turn_rate,
+                        turn_duration,
+                    )
+                deadline = time.monotonic() + duration
+                while time.monotonic() < deadline:
+                    reading = self.distance()
+                    final_distance = reading["centimeters"]
+                    if final_distance <= clearance:
+                        stopped_for_obstacle = True
+                        break
+                    self.drive(speed_value, 90.0, 0.0)
+                    time.sleep(min(0.15, max(0.01, deadline - time.monotonic())))
+            finally:
+                self.stop()
+        return {
+            "relative_angle": angle,
+            "turn_duration": round(turn_duration, 3),
+            "approach_duration": duration,
+            "speed": speed_value,
+            "clearance_cm": clearance,
+            "stopped_for_obstacle": stopped_for_obstacle,
+            "final_distance_cm": final_distance,
         }
 
     def servo(self, servo_id: Any, pulse: Any, duration: Any = 0.5) -> Dict[str, Any]:

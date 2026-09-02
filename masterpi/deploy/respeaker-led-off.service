@@ -1,0 +1,7 @@
+[Unit]
+Description=Turn off ReSpeaker USB 4-Mic Array LEDs
+Documentation=https://github.com/respeaker/pixel_ring/wiki/ReSpeaker-USB-4-Mic-Array-LED-Control-Protocol
+
+[Service]
+Type=oneshot
+ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.venv/bin/python -m masterpi_control.respeaker_leds

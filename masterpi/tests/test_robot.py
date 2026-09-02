@@ -176,29 +176,59 @@ class RobotTests(unittest.TestCase):
         with patch("masterpi_control.robot.time.sleep"), patch(
             "masterpi_control.robot.time.monotonic", side_effect=itertools.count(0, 0.1)
         ):
-            result = self.robot.drive_for("forward", 25, 0.5)
-        self.assertEqual(result, {"direction": "forward", "speed": 25.0, "duration": 0.5})
+            result = self.robot.drive_for("forward", duration=0.5)
+        self.assertEqual(
+            result,
+            {
+                "direction": "forward",
+                "speed": 40.0,
+                "heading": 90.0,
+                "angular_rate": 0.0,
+                "duration": 0.5,
+            },
+        )
         drive_events = [event for event in self.backend.events if event["action"] == "drive"]
         motion_events = [event for event in drive_events if event["speed"] > 0]
         self.assertGreaterEqual(len(motion_events), 1)
+        self.assertTrue(all(event["speed"] == 40.0 for event in motion_events))
         self.assertTrue(all(event["direction"] == 90.0 for event in motion_events))
         self.assertEqual(drive_events[-1]["speed"], 0.0)
+
+    def test_drive_for_rotation_matches_webpage_without_translation(self):
+        with patch("masterpi_control.robot.time.sleep"), patch(
+            "masterpi_control.robot.time.monotonic", side_effect=itertools.count(0, 0.1)
+        ):
+            result = self.robot.drive_for("rotate_left", duration=0.5)
+        self.assertEqual(result["speed"], 0.0)
+        self.assertEqual(result["heading"], 90.0)
+        self.assertEqual(result["angular_rate"], -0.6)
+        motion_events = [
+            event
+            for event in self.backend.events
+            if event["action"] == "drive" and event["angular_rate"] != 0
+        ]
+        self.assertTrue(motion_events)
+        self.assertTrue(all(event["speed"] == 0.0 for event in motion_events))
+        self.assertTrue(all(event["direction"] == 90.0 for event in motion_events))
 
     def test_reactive_navigation_stops_and_turns_for_obstacle(self):
         self.robot.backend.mock_distance_mm = 200
         with patch("masterpi_control.robot.time.sleep"), patch(
             "masterpi_control.robot.time.monotonic", side_effect=itertools.count(0, 0.1)
         ):
-            result = self.robot.avoid_obstacles(1, 20, 30)
+            result = self.robot.avoid_obstacles(1, 40, 30)
         self.assertEqual(result["mode"], "reactive_obstacle_avoidance")
         self.assertEqual(result["obstacles_avoided"], 1)
         drive_events = [event for event in self.backend.events if event["action"] == "drive"]
-        self.assertTrue(any(event["angular_rate"] == 1.0 for event in drive_events))
+        turn_events = [event for event in drive_events if event["angular_rate"] == 0.6]
+        self.assertTrue(turn_events)
+        self.assertTrue(all(event["speed"] == 0.0 for event in turn_events))
+        self.assertTrue(all(event["direction"] == 90.0 for event in turn_events))
         self.assertEqual(drive_events[-1]["speed"], 0.0)
 
     def test_drive_for_rejects_unsupported_direction(self):
         with self.assertRaisesRegex(ValidationError, "direction"):
-            self.robot.drive_for("diagonal", 20, 1)
+            self.robot.drive_for("diagonal")
 
     def test_watchdog_stops_stale_motion(self):
         self.robot.drive(40, 90, 0)

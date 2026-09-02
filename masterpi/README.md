@@ -117,6 +117,42 @@ then open `https://10.0.0.102:8443/`. A private-IP certificate cannot be issued
 by a public certificate authority, so installing the local CA is required once
 on each browser device.
 
+### ReSpeaker USB microphone LEDs
+
+The ReSpeaker USB 4-Mic Array firmware starts in trace mode, so its ring reacts
+to voice activity and direction of arrival. To keep the ring and center VAD LED
+off, install the included system service and device-trigger rule once:
+
+```bash
+sudo install -m 0644 deploy/respeaker-led-off.service /etc/systemd/system/
+sudo install -m 0644 deploy/99-respeaker-led-off.rules /etc/udev/rules.d/
+sudo systemctl daemon-reload
+sudo udevadm control --reload-rules
+sudo systemctl start respeaker-led-off.service
+```
+
+The udev rule starts the one-shot service again after each USB reconnect and on
+future boots. It matches only Seeed USB device `2886:0018` and grants the
+`plugdev` group access to the vendor interface used for DOA. Unplug and reconnect
+the array (or reboot) after installing or changing the rule.
+
+The hibot MCP exposes `sound_direction` and `come_here`. The latter averages
+five hardware DOA readings, rotates toward the relative bearing, approaches at
+40 mm/s for at most two seconds, and stops when the front ultrasonic reading is
+45 cm or less. DOA provides an angle, not source distance, so this is a bounded
+reactive approach rather than sound-source localization in Cartesian space.
+
+Seeed notes that DOA orientation depends on the microphone build and mounting.
+Speak from directly in front of the robot and inspect the raw readings:
+
+```bash
+.venv/bin/masterpi sound-direction --samples 7
+```
+
+If straight ahead reports (for example) 90 degrees, add
+`--sound-front-angle 90` to the installed `masterpi serve` command. If angles
+increase toward the robot's left, also add `--sound-counterclockwise`.
+
 The ultrasonic-distance card polls the Hiwonder I²C sensor at address `0x77`
 and displays centimetres. Its color picker controls both RGB LEDs on the
 sensor. Both ultrasonic LEDs are turned off whenever the controller starts.
@@ -211,6 +247,8 @@ object, including `/api/stop`.
 | `POST /api/grab` | `{"target":"red"}` |
 | `POST /api/camera/analyze` | `{}` (Check front + Hermes vision) |
 | `POST /api/camera/analyze/color` | `{"samples":3}` |
+| `POST /api/agent/sound_direction` | `{"samples":5}` (loopback only) |
+| `POST /api/agent/come_here` | `{"approach_duration":2,"clearance_cm":45}` (loopback only) |
 | `POST /api/rgb` | `{"red":255,"green":0,"blue":0}` |
 | `POST /api/buzzer` | `{"frequency":1900,"on_time":0.1,"off_time":0.1,"repeat":1}` |
 

@@ -13,6 +13,7 @@ from .backends import BackendUnavailable, MockBackend, VendorBackend
 from .camera import CameraStream, CameraUnavailable
 from .robot import Robot, RobotError, ValidationError
 from .server import serve
+from .sound import ReSpeakerDirection, SoundTracker
 from .vision import SUPPORTED_COLORS, VisionGrasper
 
 
@@ -31,6 +32,17 @@ def _parser() -> argparse.ArgumentParser:
     web.add_argument("--certfile", help="HTTPS server certificate PEM")
     web.add_argument("--keyfile", help="HTTPS private key PEM")
     web.add_argument("--ca-certfile", help="CA certificate exposed for client installation")
+    web.add_argument(
+        "--sound-front-angle",
+        type=float,
+        default=0,
+        help="ReSpeaker DOA angle that points straight ahead, 0..359",
+    )
+    web.add_argument(
+        "--sound-counterclockwise",
+        action="store_true",
+        help="treat increasing ReSpeaker DOA angles as counter-clockwise",
+    )
 
     drive = sub.add_parser("drive", help="drive briefly, then stop")
     drive.add_argument("speed", type=float, help="linear speed, 0..100 mm/s")
@@ -74,6 +86,11 @@ def _parser() -> argparse.ArgumentParser:
     buzzer.add_argument("--repeat", type=int, default=1)
 
     sub.add_parser("diagnose", help="show the detected vendor modules")
+
+    sound = sub.add_parser("sound-direction", help="read the ReSpeaker sound bearing")
+    sound.add_argument("--samples", type=int, default=5)
+    sound.add_argument("--front-angle", type=float, default=0)
+    sound.add_argument("--counterclockwise", action="store_true")
     return parser
 
 
@@ -108,6 +125,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 certfile=args.certfile,
                 keyfile=args.keyfile,
                 ca_certfile=args.ca_certfile,
+                sound_front_angle=args.sound_front_angle,
+                sound_clockwise=not args.sound_counterclockwise,
             )
             return 0
         if args.command == "drive":
@@ -147,6 +166,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = robot.rgb(args.red, args.green, args.blue)
         elif args.command == "buzzer":
             result = robot.buzzer(args.frequency, args.on, args.off, args.repeat)
+        elif args.command == "sound-direction":
+            result = SoundTracker(
+                robot,
+                ReSpeakerDirection(
+                    front_angle=args.front_angle,
+                    clockwise=not args.counterclockwise,
+                ),
+            ).direction(args.samples)
         else:  # argparse guarantees this is unreachable.
             raise AssertionError(args.command)
         _print(result)

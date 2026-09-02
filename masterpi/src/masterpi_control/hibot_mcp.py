@@ -67,17 +67,42 @@ def analyze_camera(samples: int = 3) -> dict[str, Any]:
 
 
 @mcp.tool()
-def drive_for(direction: str, speed: float, duration: float) -> dict[str, Any]:
-    """Drive only in a named direction for a bounded interval (max 35% speed, 8 s)."""
+def drive_for(
+    direction: str, duration: float = 1.0, speed: float = 40.0
+) -> dict[str, Any]:
+    """Drive with the webpage chassis mapping; speed is 40-100 mm/s, duration max 8 s."""
     return client.call("drive_for", {"direction": direction, "speed": speed, "duration": duration})
 
 
 @mcp.tool()
-def avoid_obstacles(duration: float, speed: float = 20, clearance_cm: float = 30) -> dict[str, Any]:
+def avoid_obstacles(duration: float, speed: float = 40, clearance_cm: float = 30) -> dict[str, Any]:
     """Move forward with ultrasonic obstacle detection; stop, turn right once, and stop."""
     return client.call(
         "avoid_obstacles",
         {"duration": duration, "speed": speed, "clearance_cm": clearance_cm},
+    )
+
+
+@mcp.tool()
+def sound_direction(samples: int = 5) -> dict[str, Any]:
+    """Read hibot's ReSpeaker sound bearing without moving the chassis."""
+    return client.call("sound_direction", {"samples": samples})
+
+
+@mcp.tool()
+def come_here(
+    approach_duration: float = 2.0,
+    clearance_cm: float = 45,
+    samples: int = 5,
+) -> dict[str, Any]:
+    """Turn toward the latest sound bearing, approach briefly, and stop before obstacles."""
+    return client.call(
+        "come_here",
+        {
+            "approach_duration": approach_duration,
+            "clearance_cm": clearance_cm,
+            "samples": samples,
+        },
     )
 
 

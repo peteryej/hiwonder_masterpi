@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from .camera import CameraStream, CameraUnavailable
 from .chat import HermesChat
 from .robot import Robot, RobotError, ValidationError
+from .sound import ReSpeakerDirection, SoundTracker, SoundUnavailable
 from .vision import VisionGrasper, annotate_object_detections
 
 LOG = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ def make_handler(
     chat: Any = None,
     ca_certificate: Optional[bytes] = None,
     vision_grasper: Any = None,
+    sound_tracker: Any = None,
 ) -> type[BaseHTTPRequestHandler]:
     index = _index_html()
     chat_service = chat or HermesChat()
@@ -50,6 +52,7 @@ def make_handler(
         if vision_grasper is not None
         else (VisionGrasper(robot, camera) if camera is not None else None)
     )
+    tracker = sound_tracker or SoundTracker(robot)
 
     def recognize_and_grab(data: Dict[str, Any]) -> Dict[str, Any]:
         if grasper is None:
@@ -373,10 +376,18 @@ def make_handler(
                     ),
                     "/api/agent/state": lambda d: robot.snapshot(),
                     "/api/agent/drive_for": lambda d: robot.drive_for(
-                        d.get("direction"), d.get("speed"), d.get("duration")
+                        d.get("direction"), d.get("duration", 1.0), d.get("speed", 40)
                     ),
                     "/api/agent/avoid_obstacles": lambda d: robot.avoid_obstacles(
-                        d.get("duration"), d.get("speed", 20), d.get("clearance_cm", 30)
+                        d.get("duration"), d.get("speed", 40), d.get("clearance_cm", 30)
+                    ),
+                    "/api/agent/sound_direction": lambda d: tracker.direction(
+                        d.get("samples", 5)
+                    ),
+                    "/api/agent/come_here": lambda d: tracker.come_here(
+                        d.get("approach_duration", 2.0),
+                        d.get("clearance_cm", 45),
+                        d.get("samples", 5),
                     ),
                     "/api/agent/stop": lambda d: robot.stop(),
                     "/api/agent/home": lambda d: robot.home(d.get("duration", 1.5)),
@@ -415,6 +426,11 @@ def make_handler(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     {"ok": False, "error": str(exc)},
                 )
+            except SoundUnavailable as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
             except ValueError as exc:
                 self._send_json(
                     HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -441,10 +457,23 @@ def serve(
     certfile: Optional[str] = None,
     keyfile: Optional[str] = None,
     ca_certfile: Optional[str] = None,
+    sound_front_angle: float = 0,
+    sound_clockwise: bool = True,
 ) -> None:
     camera_stream = camera or CameraStream()
     ca_certificate = Path(ca_certfile).read_bytes() if ca_certfile else None
-    handler = make_handler(robot, camera_stream, ca_certificate=ca_certificate)
+    handler = make_handler(
+        robot,
+        camera_stream,
+        ca_certificate=ca_certificate,
+        sound_tracker=SoundTracker(
+            robot,
+            ReSpeakerDirection(
+                front_angle=sound_front_angle,
+                clockwise=sound_clockwise,
+            ),
+        ),
+    )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     tls_server: Optional[ThreadingHTTPServer] = None

@@ -28,6 +28,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.keyfile, "/tls/server.key")
         self.assertEqual(args.ca_certfile, "/tls/ca.crt")
 
+    def test_sound_direction_accepts_array_orientation(self):
+        args = _parser().parse_args(
+            ["sound-direction", "--samples", "7", "--front-angle", "90", "--counterclockwise"]
+        )
+        self.assertEqual(args.samples, 7)
+        self.assertEqual(args.front_angle, 90)
+        self.assertTrue(args.counterclockwise)
+
 
 if __name__ == "__main__":
     unittest.main()
