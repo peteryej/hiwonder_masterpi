@@ -1,0 +1,20 @@
+[Unit]
+Description=MasterPi local openWakeWord listener
+After=default.target
+ConditionPathExists=/home/pi/projs/hiwonder_masterpi/masterpi/models/openwakeword/hello_hibot.onnx
+ConditionPathExists=/home/pi/projs/hiwonder_masterpi/masterpi/models/openwakeword/melspectrogram.onnx
+ConditionPathExists=/home/pi/projs/hiwonder_masterpi/masterpi/models/openwakeword/embedding_model.onnx
+ConditionPathExists=/home/pi/projs/hiwonder_masterpi/masterpi/assets/im-here.wav
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/projs/hiwonder_masterpi/masterpi
+Environment=PYTHONPATH=/home/pi/projs/hiwonder_masterpi/masterpi/src
+Environment=HOME=/home/pi
+Environment=MASTERPI_HERMES_BIN=/home/pi/.local/bin/hermes
+ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.wakeword-venv/bin/python -m masterpi_control.wake_word --conversation --threshold 0.5
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

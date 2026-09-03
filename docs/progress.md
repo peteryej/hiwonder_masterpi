@@ -1,6 +1,39 @@
 # MasterPi progress
 
-Last updated: 2026-09-01
+2026-09-02
+
+## Done
+
+- Added local wake-word detection with openWakeWord instead of Picovoice:
+  - captures the ReSpeaker's processed one-channel, 16-bit, 16 kHz ALSA stream;
+  - runs a supplied ONNX wake-word model in local inference with no account,
+    key, or cloud transcription;
+  - uses openWakeWord's preferred 80 ms frames and configurable score
+    threshold;
+  - pauses capture while playing the cached **I'm here** response, resets model
+    history, and applies a cooldown to prevent feedback activation;
+  - provides a `masterpi_control.wake_word --download-features` setup command
+    for the two official ONNX feature models and an installable systemd service;
+  - installs openWakeWord in a separate Python 3.11 environment because its
+    Raspberry Pi TFLite dependency has no Python 3.13 wheel;
+  - downloaded the two required official ONNX feature models and generated the
+    cached 16-bit mono, 16 kHz `assets/im-here.wav` response with Hermes TTS;
+  - added a bounded multi-turn voice session after wake: energy/silence-based
+    utterance capture, Hermes STT and persistent agent chat, spoken Hermes TTS
+    replies, follow-up turns without repeating the wake phrase, exit phrases,
+    silence timeout, and a six-turn maximum.
+
+## Wake-word deployment
+
+- The trained and foreground-tested model is installed at
+  `masterpi/models/openwakeword/hello_hibot.onnx`; threshold `0.5` was
+  physically validated by the user.
+- The service is packaged as a per-user systemd unit because system-wide
+  installation requires the Pi's interactive sudo password. It was installed
+  at `~/.config/systemd/user/masterpi-wake-word.service`, enabled, and started;
+  systemd reports it active with zero restarts.
+
+2026-09-01
 
 ## Done
 
@@ -85,7 +118,11 @@ motors have encoders. Then implement, in order:
 
 ## Verification
 
-- Full test suite: 90 tests passing.
+- Full test suite: 96 tests passing.
+- openWakeWord ONNX inference smoke test passed on this Raspberry Pi using an
+  official `hey jarvis` model and the downloaded feature models.
+- The user physically validated live ReSpeaker wake detection at threshold
+  `0.5`; the installed conversational service remains to be voice-tested.
 - Python bytecode compilation and `git diff --check`: passing.
 - Physical “come here” validation is intentionally pending the USB permission
   update and DOA mounting calibration above.

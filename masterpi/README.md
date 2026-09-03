@@ -153,6 +153,86 @@ If straight ahead reports (for example) 90 degrees, add
 `--sound-front-angle 90` to the installed `masterpi serve` command. If angles
 increase toward the robot's left, also add `--sound-counterclockwise`.
 
+### Local wake word with openWakeWord
+
+Wake-word detection runs locally on Linux and uses the ReSpeaker's processed
+mono 16 kHz stream. No Picovoice account, AccessKey, or cloud transcription is
+involved. The response is also a cached local WAV file, so saying **hello
+hibot** can produce **I'm here** without waiting for Hermes.
+
+openWakeWord 0.6.0 does not ship a `hello hibot` model. Use its
+[official automated training notebook](https://github.com/dscripka/openWakeWord/blob/main/notebooks/automatic_model_training.ipynb)
+to train that phrase, export the ONNX model, and save it as:
+
+```text
+/home/pi/projs/hiwonder_masterpi/masterpi/models/openwakeword/hello_hibot.onnx
+```
+
+The controller uses Python 3.13, but openWakeWord's TFLite dependency currently
+has no Python 3.13 Raspberry Pi wheel. Keep it isolated in the installed Python
+3.11 environment:
+
+```bash
+cd /home/pi/projs/hiwonder_masterpi
+/home/pi/.local/bin/python3.11 -m venv masterpi/.wakeword-venv
+masterpi/.wakeword-venv/bin/pip install openwakeword==0.6.0
+PYTHONPATH=masterpi/src masterpi/.wakeword-venv/bin/python \
+  -m masterpi_control.wake_word --download-features
+```
+
+Generate **I'm here** once with the existing Hermes TTS endpoint and convert it
+to the WAV file used by `aplay`:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/chat/tts \
+  -H 'Content-Type: application/json' \
+  --data "{\"text\":\"I'm here.\"}" \
+  -o /tmp/im-here.mp3
+ffmpeg -y -i /tmp/im-here.mp3 -ar 16000 -ac 1 \
+  masterpi/assets/im-here.wav
+```
+
+Connect an active speaker or headphones to the ReSpeaker 3.5 mm output, then
+test in the foreground:
+
+```bash
+PYTHONPATH=masterpi/src masterpi/.wakeword-venv/bin/python \
+  -m masterpi_control.wake_word --conversation --threshold 0.5
+```
+
+The listener addresses the array by stable ALSA name
+`plughw:CARD=ArrayUAC10,DEV=0`, feeds openWakeWord 80 ms frames, pauses capture
+while the reply plays, resets the model, and waits 0.75 seconds before
+listening again. Start with the default `0.5` score threshold. Raise it with
+`--threshold 0.6` if normal conversation causes false activations, or lower it
+slightly if the phrase is missed.
+
+With `--conversation`, wake detection plays **I'm here**, waits up to ten
+seconds for speech, records until one second of silence, sends the WAV to
+Hermes speech-to-text, continues the persistent `hibot-voice` agent session,
+and speaks the reply through the ReSpeaker output. After each reply it accepts
+a follow-up for eight seconds without requiring the wake phrase again. It
+returns to wake-word mode after silence, six turns, or an explicit **goodbye**,
+**stop listening**, **that's all**, or **end conversation**.
+
+Only wake detection is fully local. Spoken conversations use Hermes' configured
+STT, agent model, and TTS providers, so those providers must be configured and
+may require network access. If room noise starts recordings, raise
+`--speech-threshold 300`; lower it if normal speech is not captured.
+
+After foreground testing succeeds, install the included service:
+
+```bash
+install -D -m 0644 deploy/masterpi-wake-word.service \
+  ~/.config/systemd/user/masterpi-wake-word.service
+systemctl --user daemon-reload
+systemctl --user enable --now masterpi-wake-word.service
+journalctl --user -u masterpi-wake-word.service -f
+```
+
+The ReSpeaker LED-off service is independent and remains effective while the
+wake-word listener is running.
+
 The ultrasonic-distance card polls the Hiwonder I²C sensor at address `0x77`
 and displays centimetres. Its color picker controls both RGB LEDs on the
 sensor. Both ultrasonic LEDs are turned off whenever the controller starts.
