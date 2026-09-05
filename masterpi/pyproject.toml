@@ -18,6 +18,7 @@ dependencies = [
   "pyserial>=3.5",
   "PyYAML>=6.0",
   "smbus2>=0.4.3",
+  "websocket-client>=1.8,<2",
   "mcp>=1.22,<2",
 ]
 

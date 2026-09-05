@@ -4,6 +4,24 @@
 
 ## Done
 
+- Replaced the wake conversation's serialized local-STT → Hermes CLI → Edge
+  TTS path with a direct OpenAI Realtime speech-to-speech implementation. The
+  local openWakeWord detector and utterance gate remain, but one persistent
+  `gpt-realtime-2.1` WebSocket now receives 24 kHz PCM and streams returned PCM
+  chunks directly into `aplay` as they arrive.
+- Added a dedicated HiBot voice prompt that identifies itself as the physical
+  Hiwonder MasterPi robot and describes its mecanum chassis, arm, gripper camera,
+  ultrasonic sensor, LEDs, buzzer, ReSpeaker, and supported actions. It limits
+  normal answers to one or two sentences and explicitly says this no-Hermes
+  voice path has no control tools, preventing false claims that an action ran.
+- Kept input/output transcripts and connecting, listening, thinking, streaming,
+  completion, and error stages in the webpage conversation feed. Each completed
+  turn now displays capture, end-of-speech-to-first-audio, and complete-stream
+  timing, and the thinking LEDs switch off on the first returned audio chunk.
+- Added PCM resampling, raw streaming playback, Realtime event/error handling,
+  multi-turn conversation, prompt, and timing tests. Installed
+  `websocket-client` 1.9.2 in the dedicated wake-word environment and added it
+  to package dependencies.
 - Disabled voice barge-in at the user's request. The packaged wake-word unit
   now starts with `--no-barge-in`; Hermes' own `voice.barge_in` setting is also
   disabled so both the custom listener and Hermes voice mode agree.
@@ -33,12 +51,14 @@
 
 ## Verification
 
-- Full test suite: 107 tests passing.
+- Full test suite: 113 tests passing.
 - Python bytecode compilation and `git diff --check`: passing.
-- Installed the updated wake-word unit and restarted both user services. The
-  wake listener and MasterPi controller are active with zero restarts; the live
-  status API reports idle/ready and the served page contains the voice poller
-  and thinking animation.
+- Installed and restarted the direct-Realtime wake listener; systemd reports it
+  active with zero restarts and an explicit `--conversation-backend realtime`
+  command. The MasterPi controller and webpage voice feed remain available.
+- A real Realtime audio-in/audio-out smoke test sent the existing 1.776-second
+  **“I'm here”** WAV, received the correct transcript, and audibly streamed a
+  five-second HiBot reply through the ReSpeaker output.
 - A direct Hermes smoke test successfully answered **“What can you do?”** using
   the same chat integration. Live wake-to-answer and browser rendering remain
   to be physically checked with the microphone and browser.
@@ -52,6 +72,39 @@
   permission update documented below.
 
 ## Measured voice latency
+
+The direct Realtime code now records these values for every physical turn:
+
+| Realtime metric | Measurement point |
+| --- | --- |
+| Capture | Start listening through the local three-second ending silence |
+| First audio | Committed input through the first `response.output_audio.delta` |
+| Response complete | Committed input through `response.done` |
+| Playback complete | Committed input through the final streamed `aplay` drain |
+
+A deterministic local stress check processed a synthetic seven-second input
+plus fifty PCM output events (ten seconds of reply audio) in **37.98 ms median**
+and **43.60 ms p95** over 100 runs in the deployed Python 3.11 environment. This
+measures Pi-side resampling, Base64, JSON, and event dispatch overhead only.
+
+The first real `gpt-realtime-2.1` audio test measured:
+
+| Stage | Elapsed time |
+| --- | ---: |
+| Secure WebSocket and session handshake | 0.407 s |
+| Upload/resample dispatch | 0.069 s |
+| Committed speech to first audible audio | 0.745 s |
+| Committed speech to `response.done` | 4.016 s |
+| Committed speech through playback drain | 5.941 s |
+| Generated reply audio duration | 5.000 s |
+
+The input was the existing 1.776-second **“I'm here”** WAV. The complete
+wall-clock turn was 5.973 seconds, and the returned input transcript was
+correct. A separate initial authentication/schema probe took 1.639 seconds;
+subsequent connections were faster. The persistent connection is reused for
+all follow-up turns after each wake.
+
+For comparison, the previous serialized Hermes pipeline measured:
 
 The latest physical **“What can you do?”** turn produced these timestamps:
 
@@ -101,27 +154,12 @@ direct Realtime `voice` mode is the useful reference. Robot actions should be
 exposed as narrow worker tools or mapped from the existing reliable
 `send_client_action` channel to MasterPi's bounded `/api/agent/*` endpoints.
 
-### Realtime migration TODO
+### Direct Realtime remaining TODO
 
-1. First validate the unmodified web demo with a LiveKit server, token API,
-   worker, and an `OPENAI_API_KEY`; `voice-agent/.env`, `node_modules`, and the
-   runtime services are not present yet.
-2. Add a MasterPi-specific voice-agent definition with a one-or-two-sentence
-   response rule and explicit bounded robot action schemas.
-3. Add a token-proxy route and SDK client to the MasterPi webpage for an early
-   end-to-end latency test. This uses the browser device's microphone and
-   speaker, not necessarily the robot's ReSpeaker.
-4. For the actual headless robot, implement a Pi LiveKit participant that
-   publishes the processed ReSpeaker ALSA capture and sends subscribed audio to
-   the ReSpeaker ALSA playback device. Keep the Realtime/LiveKit session warm,
-   but publish microphone audio only after local openWakeWord detection.
-5. Relay Realtime transcript and session-state events into the existing
-   `GET /api/voice/conversation` feed so the current webpage continues to show
-   listening, thinking, tool, and reply activity.
-6. Benchmark wake-to-first-transcript, end-of-speech-to-first-audio, and full
-   response duration before replacing the current Hermes pipeline. Retain the
-   current service as a fallback until ReSpeaker capture/playback and robot
-   actions are physically validated.
+1. Physically say **“Hello HiBot”** followed by **“What can you do?”** to verify
+   the complete microphone-triggered path.
+2. Confirm that the webpage shows the live transcript and its capture,
+   first-audio, response-complete, and playback-complete timing row.
 
 2026-09-03
 

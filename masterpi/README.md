@@ -175,7 +175,8 @@ has no Python 3.13 Raspberry Pi wheel. Keep it isolated in the installed Python
 ```bash
 cd /home/pi/projs/hiwonder_masterpi
 /home/pi/.local/bin/python3.11 -m venv masterpi/.wakeword-venv
-masterpi/.wakeword-venv/bin/pip install openwakeword==0.6.0 'pyusb>=1.3,<2'
+masterpi/.wakeword-venv/bin/pip install openwakeword==0.6.0 'pyusb>=1.3,<2' \
+  'websocket-client>=1.8,<2'
 PYTHONPATH=masterpi/src masterpi/.wakeword-venv/bin/python \
   -m masterpi_control.wake_word --download-features
 ```
@@ -192,10 +193,28 @@ ffmpeg -y -i /tmp/im-here.mp3 -ar 16000 -ac 1 \
   masterpi/assets/im-here.wav
 ```
 
+The direct conversation requires OpenAI API access and a standard API key.
+Store it outside the repository with owner-only permissions:
+
+```bash
+install -d -m 0700 ~/.config/masterpi
+read -rsp 'OpenAI API key: ' HIBOT_OPENAI_KEY; echo
+printf 'OPENAI_API_KEY=%s\n' "$HIBOT_OPENAI_KEY" > ~/.config/masterpi/openai.env
+unset HIBOT_OPENAI_KEY
+chmod 0600 ~/.config/masterpi/openai.env
+```
+
+An ignored repository-root `.env` containing `OPENAI_API_KEY=...` is also
+supported. Keep it mode `0600`; when both files exist, the repository `.env`
+takes precedence.
+
 Connect an active speaker or headphones to the ReSpeaker 3.5 mm output, then
 test in the foreground:
 
 ```bash
+set -a
+. ~/.config/masterpi/openai.env
+set +a
 PYTHONPATH=masterpi/src masterpi/.wakeword-venv/bin/python \
   -m masterpi_control.wake_word --conversation --threshold 0.5
 ```
@@ -207,49 +226,48 @@ listening again. Start with the default `0.5` score threshold. Raise it with
 `--threshold 0.6` if normal conversation causes false activations, or lower it
 slightly if the phrase is missed.
 
-With `--conversation`, each wake creates a fresh `hibot-voice-*` Hermes session
-and plays **I'm here**. Speech must remain above RMS 200 for four 80 ms frames
-before it is accepted; recording then ends after three seconds of silence. The
-service sends each WAV to Hermes speech-to-text, speaks the reply through the
-ReSpeaker output, and listens for follow-ups without requiring the wake phrase
-again. Hermes' voice-mode transcription wrapper filters common Whisper
-hallucinations, treating filtered or empty results as silence. Three
+With `--conversation`, each wake opens a persistent direct OpenAI Realtime
+speech-to-speech session and plays **I'm here**. It does not connect to Hermes.
+Speech must remain above RMS 200 for four 80 ms frames before it is accepted;
+recording then ends after three seconds of silence. The captured PCM is
+resampled from 16 kHz to the Realtime API's 24 kHz PCM format, sent directly to
+`gpt-realtime-2.1`, and returned audio chunks are streamed immediately to
+`aplay` rather than waiting for a complete TTS file. Follow-up turns retain the
+same Realtime conversation without requiring the wake phrase again. Three
 consecutive 15-second silent cycles, 30 user turns, or an exact
 **stop**, **goodbye**, **never mind**, **cancel**, **stop listening**, **that's
 all**, or **end conversation** returns it to wake-word mode.
 
-Robot voice conversations explicitly use the fast `gpt-5.6-luna` model through
-the `openai-codex` provider with low reasoning effort. This override is scoped
-to the wake-word service; typed web chat and other Hermes channels continue to
-use their own configured model. The agent toolset remains `safe` so the robot's
-configured hibot MCP actions are still available.
+The Realtime session prompt identifies the speaker as the physical **HiBot**
+MasterPi robot, describes its mecanum chassis, arm, gripper-mounted camera,
+ultrasonic sensor, LEDs, buzzer, microphone array, and supported software
+actions, and normally limits answers to one or two short sentences. This fast
+voice path intentionally has no Hermes/MCP tools; it will not claim that it
+performed an action. Use the webpage or tool-enabled typed chat for physical
+robot actions.
 
-Barge-in is disabled in the installed service. While Hermes is thinking or the
-robot is speaking, finish waiting for the reply before asking the next
-question. This avoids false interruption from room noise or speaker leakage.
-The implementation still supports opt-in `--barge-in`; when enabled it samples
-the quiet-room floor and uses the larger of RMS 500 or three times that floor.
-Normal initial speech detection remains at RMS 200.
+Barge-in remains disabled in the installed service. While HiBot is thinking or
+speaking, wait for the reply before asking the next question. Normal initial
+speech detection remains local at RMS 200.
 
 The controller's **Chat with hibot** panel also displays the current spoken
-conversation. It shows what STT heard, Hermes' reply, an animated thinking
-indicator, and intermediate listening, transcription, agent, TTS, playback,
-interruption, and error stages. Each stage identifies the tool or subsystem
-when that information is available. The page reads the wake service's atomic
-status snapshot through `GET /api/voice/conversation`; Hermes is run in quiet
-reply mode, so internal agent tool calls that Hermes does not emit are not
-guessed or displayed.
+conversation. It shows OpenAI's input transcript, HiBot's output transcript, an
+animated thinking indicator, and connecting, listening, thinking, streaming,
+and error stages. The page reads the wake service's atomic status snapshot
+through `GET /api/voice/conversation`.
 
-While Hermes is processing a submitted question, the ReSpeaker runs its
+While Realtime is processing a submitted question, the ReSpeaker runs its
 built-in clockwise spin animation with a low-brightness blue/cyan palette. The
-ring is returned to mono black before reply playback, on interruption, and on
+ring is returned to mono black as soon as the first audio chunk arrives and on
 every error path. Dynamic control runs in the unprivileged wake-word service,
 so the installed udev rule must be the repository version that assigns the
 device to `plugdev`; after updating the rule, reconnect the array or reboot.
 
-Only wake detection is fully local. Spoken conversations use Hermes' configured
-STT, agent model, and TTS providers, so those providers must be configured and
-may require network access. If room noise starts recordings, raise
+Wake detection remains fully local. The service reads the key file through
+systemd and defaults to
+`--conversation-backend realtime --realtime-model gpt-realtime-2.1`. The old
+Hermes pipeline remains available only as an explicit diagnostic fallback with
+`--conversation-backend hermes`. If room noise starts recordings, raise
 `--speech-threshold`; lower it if normal speech is not captured.
 
 After foreground testing succeeds, install the included service:

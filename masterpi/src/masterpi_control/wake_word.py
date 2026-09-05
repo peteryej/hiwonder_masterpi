@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import numpy as np
 
 from .chat import ChatError, ChatInterrupted, NoSpeechDetected
+from .realtime_voice import RealtimeVoiceError
 
 
 SAMPLE_RATE = 16_000
@@ -845,8 +847,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--conversation",
         action="store_true",
-        help="after waking, transcribe speech, ask Hermes, speak replies, and accept follow-ups",
+        help="after waking, start a direct streaming voice conversation and accept follow-ups",
     )
+    parser.add_argument(
+        "--conversation-backend",
+        choices=("auto", "realtime", "hermes"),
+        default="auto",
+        help="voice backend; auto selects direct Realtime when OPENAI_API_KEY is set",
+    )
+    parser.add_argument("--realtime-model", default="gpt-realtime-2.1")
+    parser.add_argument("--realtime-voice", default="marin")
     parser.add_argument("--speech-threshold", type=float, default=200)
     parser.add_argument("--speech-silence", type=float, default=3.0)
     parser.add_argument("--speech-start-timeout", type=float, default=15)
@@ -858,7 +868,7 @@ def _parser() -> argparse.ArgumentParser:
         "--barge-in",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="listen for echo-cancelled speech while Hermes generates and speaks",
+        help="allow interruptions in the legacy Hermes conversation backend",
     )
     parser.add_argument("--barge-in-threshold-multiplier", type=float, default=3.0)
     parser.add_argument("--barge-in-min-threshold", type=float, default=500)
@@ -889,43 +899,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         source = ARecordSource(args.capture_device)
         conversation = None
         if args.conversation:
-            from .chat import HermesChat
             from .respeaker_leds import spin as start_thinking_leds
             from .respeaker_leds import turn_off as stop_thinking_leds
             from .voice_status import VoiceStatusWriter
 
-            chat = HermesChat(
-                session_name="hibot-voice",
-                model="gpt-5.6-luna",
-                provider="openai-codex",
-                reasoning="low",
-            )
             voice_status = VoiceStatusWriter()
             voice_status.idle()
-            conversation = VoiceConversation(
-                source,
-                UtteranceRecorder(
-                    speech_threshold=args.speech_threshold,
-                    silence_seconds=args.speech_silence,
-                    max_seconds=args.max_utterance,
-                ),
-                chat,
-                HermesReplySpeaker(
-                    chat,
-                    args.playback_device,
-                    barge_in_grace_seconds=args.barge_in_grace,
-                ),
-                initial_timeout=args.speech_start_timeout,
-                followup_timeout=args.followup_timeout,
-                max_turns=args.conversation_max_turns,
-                max_silent_cycles=args.max_silent_cycles,
-                barge_in=args.barge_in,
-                barge_in_min_threshold=args.barge_in_min_threshold,
-                barge_in_threshold_multiplier=args.barge_in_threshold_multiplier,
-                thinking_start=start_thinking_leds,
-                thinking_stop=stop_thinking_leds,
-                status=voice_status,
+            recorder = UtteranceRecorder(
+                speech_threshold=args.speech_threshold,
+                silence_seconds=args.speech_silence,
+                max_seconds=args.max_utterance,
             )
+            conversation_backend = args.conversation_backend
+            if conversation_backend == "auto":
+                conversation_backend = (
+                    "realtime" if os.environ.get("OPENAI_API_KEY", "").strip() else "hermes"
+                )
+                logging.info("auto-selected %s voice backend", conversation_backend)
+            if conversation_backend == "realtime":
+                from .realtime_voice import (
+                    OpenAIRealtimeClient,
+                    RealtimeVoiceConversation,
+                )
+
+                realtime = OpenAIRealtimeClient.from_environment(
+                    args.playback_device,
+                    model=args.realtime_model,
+                    voice=args.realtime_voice,
+                )
+                conversation = RealtimeVoiceConversation(
+                    source,
+                    recorder,
+                    realtime,
+                    initial_timeout=args.speech_start_timeout,
+                    followup_timeout=args.followup_timeout,
+                    max_turns=args.conversation_max_turns,
+                    max_silent_cycles=args.max_silent_cycles,
+                    thinking_start=start_thinking_leds,
+                    thinking_stop=stop_thinking_leds,
+                    status=voice_status,
+                )
+            else:
+                from .chat import HermesChat
+
+                chat = HermesChat(
+                    session_name="hibot-voice",
+                    model="gpt-5.6-luna",
+                    provider="openai-codex",
+                    reasoning="low",
+                )
+                conversation = VoiceConversation(
+                    source,
+                    recorder,
+                    chat,
+                    HermesReplySpeaker(
+                        chat,
+                        args.playback_device,
+                        barge_in_grace_seconds=args.barge_in_grace,
+                    ),
+                    initial_timeout=args.speech_start_timeout,
+                    followup_timeout=args.followup_timeout,
+                    max_turns=args.conversation_max_turns,
+                    max_silent_cycles=args.max_silent_cycles,
+                    barge_in=args.barge_in,
+                    barge_in_min_threshold=args.barge_in_min_threshold,
+                    barge_in_threshold_multiplier=args.barge_in_threshold_multiplier,
+                    thinking_start=start_thinking_leds,
+                    thinking_stop=stop_thinking_leds,
+                    status=voice_status,
+                )
         listener = WakeWordListener(
             model,
             source,
@@ -939,7 +981,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
-    except WakeWordError as exc:
+    except (WakeWordError, RealtimeVoiceError) as exc:
         print(f"masterpi-wake-word: {exc}", file=sys.stderr)
         return 2
 

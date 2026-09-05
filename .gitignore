@@ -9,3 +9,6 @@ dist/
 
 usb_4_mic_array/
 voice-agent/
+
+
+.env
