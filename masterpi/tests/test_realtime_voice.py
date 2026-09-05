@@ -6,6 +6,7 @@ import numpy as np
 
 from masterpi_control.realtime_voice import (
     HIBOT_REALTIME_PROMPT,
+    HIBOT_TOOL_REALTIME_PROMPT,
     OpenAIRealtimeClient,
     RawPcmPlayer,
     RealtimeVoiceError,
@@ -131,6 +132,110 @@ class RealtimeVoiceTests(unittest.TestCase):
         self.assertIn("has no robot-control tools", HIBOT_REALTIME_PROMPT)
         self.assertIn("one or two short sentences", HIBOT_REALTIME_PROMPT)
 
+    def test_tool_prompt_requires_explicit_action_and_confirmed_result(self):
+        self.assertIn("Call a physical-control tool only", HIBOT_TOOL_REALTIME_PROMPT)
+        self.assertIn("Never say an action succeeded", HIBOT_TOOL_REALTIME_PROMPT)
+        self.assertIn("must not be preceded by a color check", HIBOT_TOOL_REALTIME_PROMPT)
+
+    def test_client_executes_function_call_and_returns_output_to_model(self):
+        reply_audio = b"\x01\x02"
+        socket = FakeSocket(
+            [
+                {"type": "session.created"},
+                {"type": "session.updated"},
+                {
+                    "type": "response.done",
+                    "response": {
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "name": "get_state",
+                                "call_id": "call-1",
+                                "arguments": "{}",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "response.output_audio_transcript.done",
+                    "transcript": "The chassis is stopped.",
+                },
+                {
+                    "type": "response.output_audio.delta",
+                    "delta": base64.b64encode(reply_audio).decode("ascii"),
+                },
+                {"type": "response.done", "response": {"status": "completed", "output": []}},
+            ]
+        )
+
+        class Dispatcher:
+            schemas = [
+                {
+                    "type": "function",
+                    "name": "get_state",
+                    "description": "Read state",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+
+            def __init__(self):
+                self.calls = []
+
+            def dispatch(self, name, arguments):
+                self.calls.append((name, arguments))
+                return {"drive": {"moving": False}}
+
+        dispatcher = Dispatcher()
+        player = FakePlayer()
+        ticks = iter(float(value) for value in range(20))
+        starts = []
+        results = []
+        client = OpenAIRealtimeClient(
+            "test-key",
+            "plughw:test",
+            instructions=HIBOT_TOOL_REALTIME_PROMPT,
+            websocket_factory=lambda _url, **_kwargs: socket,
+            player_factory=lambda: player,
+            tool_dispatcher=dispatcher,
+            clock=lambda: next(ticks),
+        )
+
+        client.connect()
+        result = client.respond_text(
+            "Is your chassis stopped?",
+            on_tool_start=lambda name, arguments: starts.append((name, arguments)),
+            on_tool_result=results.append,
+        )
+
+        session = socket.sent[0]["session"]
+        self.assertEqual(session["tool_choice"], "auto")
+        self.assertEqual(session["tools"][0]["name"], "get_state")
+        self.assertEqual(dispatcher.calls, [("get_state", {})])
+        self.assertEqual(starts, [("get_state", {})])
+        self.assertTrue(results[0].ok)
+        outputs = [
+            event for event in socket.sent if event.get("item", {}).get("type") == "function_call_output"
+        ]
+        self.assertEqual(outputs[0]["item"]["call_id"], "call-1")
+        self.assertEqual(
+            json.loads(outputs[0]["item"]["output"]),
+            {"ok": True, "result": {"drive": {"moving": False}}},
+        )
+        self.assertEqual(
+            len([event for event in socket.sent if event["type"] == "response.create"]),
+            2,
+        )
+        self.assertEqual(result.transcript, "Is your chassis stopped?")
+        self.assertEqual(result.reply, "The chassis is stopped.")
+        self.assertEqual(result.tool_calls[0].name, "get_state")
+        self.assertEqual(player.audio, reply_audio)
+
     def test_raw_player_uses_24khz_mono_pcm(self):
         calls = []
 
@@ -183,7 +288,9 @@ class RealtimeVoiceTests(unittest.TestCase):
                 self.stops += 1
 
         class Recorder:
-            def capture(self, _source, *, start_timeout):
+            def capture(self, _source, *, start_timeout, on_speech_start=None):
+                if on_speech_start is not None:
+                    on_speech_start()
                 return b"\x00\x00" * 100
 
         class Client:
@@ -195,8 +302,29 @@ class RealtimeVoiceTests(unittest.TestCase):
             def connect(self):
                 return 0.25
 
-            def respond(self, _pcm, *, on_transcript, on_first_audio):
+            def respond(
+                self,
+                _pcm,
+                *,
+                on_transcript,
+                on_first_audio,
+                on_tool_start,
+                on_tool_result,
+            ):
                 on_transcript("goodbye")
+                on_tool_start("get_state", {})
+                on_tool_result(
+                    type(
+                        "Result",
+                        (),
+                        {
+                            "name": "get_state",
+                            "elapsed_seconds": 0.02,
+                            "ok": True,
+                            "result": {},
+                        },
+                    )()
+                )
                 on_first_audio()
                 return RealtimeTurnResult(
                     "goodbye", "Goodbye!", 0.01, 0.4, 0.8, 1.0, 0.5
@@ -216,6 +344,7 @@ class RealtimeVoiceTests(unittest.TestCase):
         client = Client()
         status = Status()
         leds = []
+        directions = []
         conversation = RealtimeVoiceConversation(
             source,
             Recorder(),
@@ -223,6 +352,8 @@ class RealtimeVoiceTests(unittest.TestCase):
             status=status,
             thinking_start=lambda: leds.append("spin"),
             thinking_stop=lambda: leds.append("off"),
+            voice_direction_start=lambda: directions.append("direction"),
+            voice_direction_stop=lambda: directions.append("off"),
             settle_seconds=0,
         )
 
@@ -234,11 +365,13 @@ class RealtimeVoiceTests(unittest.TestCase):
         self.assertTrue(any("streaming voice session" in text for text in texts))
         self.assertTrue(any("Turn timing:" in text for text in texts))
         self.assertTrue(any("OpenAI Realtime" in tool for tool in tools))
+        self.assertTrue(any("HiBot shared MCP action" in tool for tool in tools))
         self.assertIn(("user", "goodbye"), messages)
         self.assertIn(("hibot", "Goodbye!"), messages)
         self.assertTrue(client.closed)
         self.assertIn("spin", leds)
         self.assertEqual(leds[-1], "off")
+        self.assertEqual(directions[:2], ["direction", "off"])
 
 
 if __name__ == "__main__":

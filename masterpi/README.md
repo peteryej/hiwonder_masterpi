@@ -128,13 +128,16 @@ sudo install -m 0644 deploy/respeaker-led-off.service /etc/systemd/system/
 sudo install -m 0644 deploy/99-respeaker-led-off.rules /etc/udev/rules.d/
 sudo systemctl daemon-reload
 sudo udevadm control --reload-rules
+sudo udevadm trigger --settle --action=add --subsystem-match=usb \
+  --attr-match=idVendor=2886 --attr-match=idProduct=0018
 sudo systemctl start respeaker-led-off.service
 ```
 
 The udev rule starts the one-shot service again after each USB reconnect and on
 future boots. It matches only Seeed USB device `2886:0018` and grants the
-`plugdev` group access to the vendor interface used for DOA. Unplug and reconnect
-the array (or reboot) after installing or changing the rule.
+`plugdev` group access to the vendor interface used for DOA. The targeted
+`udevadm trigger` above reapplies it to an already connected array; alternatively,
+unplug and reconnect the array or reboot.
 
 The hibot MCP exposes `sound_direction` and `come_here`. The latter averages
 five hardware DOA readings, rotates toward the relative bearing, approaches at
@@ -242,9 +245,22 @@ The Realtime session prompt identifies the speaker as the physical **HiBot**
 MasterPi robot, describes its mecanum chassis, arm, gripper-mounted camera,
 ultrasonic sensor, LEDs, buzzer, microphone array, and supported software
 actions, and normally limits answers to one or two short sentences. This fast
-voice path intentionally has no Hermes/MCP tools; it will not claim that it
-performed an action. Use the webpage or tool-enabled typed chat for physical
-robot actions.
+voice path does not connect to the Hermes agent. Instead, it registers the same
+bounded action definitions used by the hibot MCP directly with Realtime and
+dispatches requested actions through the loopback-only `/api/agent/*`
+controller. The prompt calls physical tools only for explicit action requests
+and does not claim success until the controller result is returned.
+
+Voice actions include state, stop, chassis movement, obstacle avoidance, Home,
+Check front, individual confirmed servos, gripper, unconditional front Grab,
+camera analysis, sound direction/approach, LEDs, and buzzer. Each tool start,
+completion/failure, and elapsed time appears as an intermediate step in the
+webpage conversation feed. The direct Grab action has no color-detection
+guardrail; camera analysis is a separate action.
+
+Normal loopback control calls retain a 15-second failure deadline. Semantic
+camera analysis has a separate 180-second deadline because Check front arm
+settling and the vision-model request can exceed 15 seconds.
 
 Barge-in remains disabled in the installed service. While HiBot is thinking or
 speaking, wait for the reply before asking the next question. Normal initial
@@ -262,6 +278,12 @@ ring is returned to mono black as soon as the first audio chunk arrives and on
 every error path. Dynamic control runs in the unprivileged wake-word service,
 so the installed udev rule must be the repository version that assigns the
 device to `plugdev`; after updating the rule, reconnect the array or reboot.
+
+When the wake phrase or a conversation utterance is detected, the service
+reads the ReSpeaker's current `DOAANGLE` and lights only the nearest of its
+twelve 30-degree ring pixels in low-brightness green. That direction pixel
+stays on through utterance capture, then turns off or changes to the blue/cyan
+thinking animation. The mapping uses the array's native raw-angle orientation.
 
 Wake detection remains fully local. The service reads the key file through
 systemd and defaults to

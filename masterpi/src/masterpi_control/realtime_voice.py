@@ -35,6 +35,22 @@ web controls or the tool-enabled chat. Speak naturally and concisely. Normally
 answer in one or two short sentences. Do not use Markdown or read punctuation
 aloud."""
 
+HIBOT_TOOL_REALTIME_PROMPT = """You are HiBot, a physical Hiwonder MasterPi robot.
+Always identify yourself as HiBot when asked who you are. You have a four-wheel
+mecanum chassis, a six-servo arm with a gripper, a camera mounted above the
+gripper, a front ultrasonic sensor, controllable LEDs and buzzer, and a
+ReSpeaker USB four-microphone array connected to a speaker. You have tools for
+reading robot state, driving, moving the arm, checking the camera, grabbing the
+object directly in front, following sound, and controlling LEDs and the buzzer.
+Call a physical-control tool only when the user explicitly asks you to perform
+that action. Never say an action succeeded until its tool result confirms it.
+Use the stop tool immediately when the user asks you to stop. The grab tool is
+an unconditional quick action and must not be preceded by a color check. For a
+camera question, use analyze_camera unless the user explicitly asks for color
+detection, in which case use analyze_camera_color. Speak naturally and
+concisely, normally in one or two short sentences. Do not use Markdown or read
+punctuation aloud."""
+
 
 class RealtimeVoiceError(RuntimeError):
     """Raised when direct Realtime transport or audio handling fails."""
@@ -51,6 +67,18 @@ class RealtimeTurnResult:
     response_seconds: float
     total_seconds: float
     audio_seconds: float
+    tool_calls: tuple["RealtimeToolResult", ...] = ()
+
+
+@dataclass(frozen=True)
+class RealtimeToolResult:
+    """Observed result and latency for one model-requested robot action."""
+
+    name: str
+    arguments: dict[str, Any]
+    result: dict[str, Any]
+    elapsed_seconds: float
+    ok: bool
 
 
 def resample_pcm16(
@@ -157,6 +185,8 @@ class OpenAIRealtimeClient:
         url: str = DEFAULT_REALTIME_URL,
         websocket_factory: Optional[Callable[..., Any]] = None,
         player_factory: Optional[Callable[[], Any]] = None,
+        tool_dispatcher: Any = None,
+        max_tool_rounds: int = 4,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not api_key.strip():
@@ -174,6 +204,8 @@ class OpenAIRealtimeClient:
         self._player_factory = player_factory or (
             lambda: RawPcmPlayer(self.playback_device)
         )
+        self.tool_dispatcher = tool_dispatcher
+        self.max_tool_rounds = max_tool_rounds
         self._clock = clock
         self._socket: Optional[Any] = None
 
@@ -204,34 +236,33 @@ class OpenAIRealtimeClient:
                 header=[f"Authorization: Bearer {self.api_key}"],
                 timeout=90,
             )
-            self._send(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "type": "realtime",
-                        "model": self.model,
-                        "instructions": self.instructions,
-                        "output_modalities": ["audio"],
-                        "audio": {
-                            "input": {
-                                "format": {
-                                    "type": "audio/pcm",
-                                    "rate": REALTIME_SAMPLE_RATE,
-                                },
-                                "transcription": {"model": self.transcription_model},
-                                "turn_detection": None,
-                            },
-                            "output": {
-                                "format": {
-                                    "type": "audio/pcm",
-                                    "rate": REALTIME_SAMPLE_RATE,
-                                },
-                                "voice": self.voice,
-                            },
+            session: dict[str, Any] = {
+                "type": "realtime",
+                "model": self.model,
+                "instructions": self.instructions,
+                "output_modalities": ["audio"],
+                "audio": {
+                    "input": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": REALTIME_SAMPLE_RATE,
                         },
+                        "transcription": {"model": self.transcription_model},
+                        "turn_detection": None,
                     },
-                }
-            )
+                    "output": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": REALTIME_SAMPLE_RATE,
+                        },
+                        "voice": self.voice,
+                    },
+                },
+            }
+            if self.tool_dispatcher is not None:
+                session["tools"] = self.tool_dispatcher.schemas
+                session["tool_choice"] = "auto"
+            self._send({"type": "session.update", "session": session})
             while True:
                 event = self._receive()
                 if event.get("type") == "session.updated":
@@ -251,6 +282,8 @@ class OpenAIRealtimeClient:
         *,
         on_transcript: Optional[Callable[[str], None]] = None,
         on_first_audio: Optional[Callable[[], None]] = None,
+        on_tool_start: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        on_tool_result: Optional[Callable[[RealtimeToolResult], None]] = None,
     ) -> RealtimeTurnResult:
         """Send one captured utterance and play response audio as deltas arrive."""
 
@@ -268,13 +301,74 @@ class OpenAIRealtimeClient:
         self._send({"type": "response.create"})
         uploaded = self._clock()
 
-        transcript = ""
+        return self._receive_turn(
+            started,
+            uploaded,
+            on_transcript=on_transcript,
+            on_first_audio=on_first_audio,
+            on_tool_start=on_tool_start,
+            on_tool_result=on_tool_result,
+        )
+
+    def respond_text(
+        self,
+        text: str,
+        *,
+        on_first_audio: Optional[Callable[[], None]] = None,
+        on_tool_start: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        on_tool_result: Optional[Callable[[RealtimeToolResult], None]] = None,
+    ) -> RealtimeTurnResult:
+        """Send a text turn through the same tool/audio loop (useful for diagnostics)."""
+
+        if not text.strip():
+            raise RealtimeVoiceError("Realtime text input must not be empty")
+        self.connect()
+        started = self._clock()
+        self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text.strip()}],
+                },
+            }
+        )
+        self._send({"type": "response.create"})
+        uploaded = self._clock()
+        return self._receive_turn(
+            started,
+            uploaded,
+            initial_transcript=text.strip(),
+            transcription_done=True,
+            on_first_audio=on_first_audio,
+            on_tool_start=on_tool_start,
+            on_tool_result=on_tool_result,
+        )
+
+    def _receive_turn(
+        self,
+        started: float,
+        uploaded: float,
+        *,
+        initial_transcript: str = "",
+        transcription_done: bool = False,
+        on_transcript: Optional[Callable[[str], None]] = None,
+        on_first_audio: Optional[Callable[[], None]] = None,
+        on_tool_start: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        on_tool_result: Optional[Callable[[RealtimeToolResult], None]] = None,
+    ) -> RealtimeTurnResult:
+        """Receive audio and complete any function-call rounds until a final reply."""
+
+        transcript = initial_transcript
         reply_parts: list[str] = []
+        current_reply_parts: list[str] = []
         first_audio_at: Optional[float] = None
         response_done_at: Optional[float] = None
         response_done = False
-        transcription_done = False
         audio_bytes = 0
+        tool_rounds = 0
+        tool_results: list[RealtimeToolResult] = []
         player: Optional[Any] = None
         try:
             while not (response_done and transcription_done):
@@ -293,11 +387,12 @@ class OpenAIRealtimeClient:
                     transcription_done = True
                     logging.warning("Realtime input transcription failed: %s", event.get("error"))
                 elif event_type == "response.output_audio_transcript.delta":
-                    reply_parts.append(str(event.get("delta") or ""))
+                    current_reply_parts.append(str(event.get("delta") or ""))
                 elif event_type == "response.output_audio_transcript.done":
                     final_reply = str(event.get("transcript") or "").strip()
                     if final_reply:
-                        reply_parts = [final_reply]
+                        reply_parts.append(final_reply)
+                        current_reply_parts = []
                 elif event_type == "response.output_audio.delta":
                     try:
                         audio = base64.b64decode(event.get("delta") or "", validate=True)
@@ -314,14 +409,55 @@ class OpenAIRealtimeClient:
                     player.write(audio)
                     audio_bytes += len(audio)
                 elif event_type == "response.done":
-                    response_done_at = self._clock()
-                    response_done = True
-                    status = str((event.get("response") or {}).get("status") or "")
+                    response = event.get("response") or {}
+                    status = str(response.get("status") or "")
                     if status and status != "completed":
-                        detail = (event.get("response") or {}).get("status_details")
+                        detail = response.get("status_details")
                         raise RealtimeVoiceError(
                             f"Realtime response ended with {status}: {detail}"
                         )
+                    if current_reply_parts:
+                        reply_parts.append("".join(current_reply_parts).strip())
+                        current_reply_parts = []
+                    function_calls = self._function_calls(response)
+                    if function_calls:
+                        if self.tool_dispatcher is None:
+                            raise RealtimeVoiceError(
+                                "Realtime requested a robot tool but no dispatcher is configured"
+                            )
+                        tool_rounds += 1
+                        if tool_rounds > self.max_tool_rounds:
+                            raise RealtimeVoiceError(
+                                f"Realtime exceeded {self.max_tool_rounds} robot tool rounds"
+                            )
+                        for function_call in function_calls:
+                            tool_result = self._execute_tool_call(
+                                function_call,
+                                on_tool_start=on_tool_start,
+                            )
+                            tool_results.append(tool_result)
+                            if on_tool_result is not None:
+                                on_tool_result(tool_result)
+                            output = {
+                                "ok": tool_result.ok,
+                                "result": self._compact_tool_result(tool_result.result),
+                            }
+                            self._send(
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": function_call["call_id"],
+                                        "output": json.dumps(
+                                            output, separators=(",", ":"), ensure_ascii=False
+                                        ),
+                                    },
+                                }
+                            )
+                        self._send({"type": "response.create"})
+                    else:
+                        response_done_at = self._clock()
+                        response_done = True
         finally:
             if player is not None:
                 player.close()
@@ -329,7 +465,7 @@ class OpenAIRealtimeClient:
         response_done_at = response_done_at or finished
         return RealtimeTurnResult(
             transcript=transcript,
-            reply="".join(reply_parts).strip(),
+            reply=" ".join(part for part in reply_parts if part).strip(),
             upload_seconds=uploaded - started,
             first_audio_seconds=(
                 None if first_audio_at is None else first_audio_at - started
@@ -337,7 +473,79 @@ class OpenAIRealtimeClient:
             response_seconds=response_done_at - started,
             total_seconds=finished - started,
             audio_seconds=audio_bytes / (REALTIME_SAMPLE_RATE * 2),
+            tool_calls=tuple(tool_results),
         )
+
+    @staticmethod
+    def _function_calls(response: dict[str, Any]) -> list[dict[str, str]]:
+        calls: list[dict[str, str]] = []
+        output = response.get("output") or []
+        if not isinstance(output, list):
+            return calls
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            name = str(item.get("name") or "").strip()
+            call_id = str(item.get("call_id") or "").strip()
+            if not name or not call_id:
+                raise RealtimeVoiceError("Realtime returned an incomplete function call")
+            arguments = item.get("arguments")
+            calls.append(
+                {
+                    "name": name,
+                    "call_id": call_id,
+                    "arguments": arguments if isinstance(arguments, str) else "{}",
+                }
+            )
+        return calls
+
+    def _execute_tool_call(
+        self,
+        function_call: dict[str, str],
+        *,
+        on_tool_start: Optional[Callable[[str, dict[str, Any]], None]],
+    ) -> RealtimeToolResult:
+        name = function_call["name"]
+        started = self._clock()
+        try:
+            arguments = json.loads(function_call["arguments"] or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("tool arguments must be a JSON object")
+            if on_tool_start is not None:
+                on_tool_start(name, arguments)
+            result = self.tool_dispatcher.dispatch(name, arguments)
+            if not isinstance(result, dict):
+                raise ValueError("robot tool returned a non-object result")
+            return RealtimeToolResult(
+                name, arguments, result, self._clock() - started, True
+            )
+        except Exception as exc:
+            logging.warning("HiBot tool %s failed: %s", name, exc)
+            return RealtimeToolResult(
+                name,
+                locals().get("arguments", {}),
+                {"error": str(exc)},
+                self._clock() - started,
+                False,
+            )
+
+    @classmethod
+    def _compact_tool_result(cls, value: Any) -> Any:
+        """Keep large camera data out of function outputs while retaining detections."""
+
+        if isinstance(value, dict):
+            compact: dict[str, Any] = {}
+            for key, item in value.items():
+                if key.lower() in {"annotated_image", "image", "image_base64", "frame"}:
+                    compact[key] = "[annotated image omitted from voice model context]"
+                else:
+                    compact[key] = cls._compact_tool_result(item)
+            return compact
+        if isinstance(value, list):
+            return [cls._compact_tool_result(item) for item in value]
+        if isinstance(value, str) and len(value) > 4000:
+            return value[:4000] + "…[truncated]"
+        return value
 
     def close(self) -> None:
         socket, self._socket = self._socket, None
@@ -402,6 +610,8 @@ class RealtimeVoiceConversation:
         max_silent_cycles: int = 3,
         thinking_start: Optional[Callable[[], None]] = None,
         thinking_stop: Optional[Callable[[], None]] = None,
+        voice_direction_start: Optional[Callable[[], None]] = None,
+        voice_direction_stop: Optional[Callable[[], None]] = None,
         status: Any = None,
         settle_seconds: float = 0.25,
         sleeper: Callable[[float], None] = time.sleep,
@@ -416,6 +626,8 @@ class RealtimeVoiceConversation:
         self.max_silent_cycles = max_silent_cycles
         self.thinking_start = thinking_start
         self.thinking_stop = thinking_stop
+        self.voice_direction_start = voice_direction_start
+        self.voice_direction_stop = voice_direction_stop
         self.status = status
         self.settle_seconds = settle_seconds
         self._sleep = sleeper
@@ -453,8 +665,15 @@ class RealtimeVoiceConversation:
                     self._sleep(self.settle_seconds)
                 capture_started = self._clock()
                 self.source.start()
-                pcm = self.recorder.capture(self.source, start_timeout=timeout)
-                self.source.stop()
+                try:
+                    pcm = self.recorder.capture(
+                        self.source,
+                        start_timeout=timeout,
+                        on_speech_start=lambda: self._set_voice_direction(True),
+                    )
+                finally:
+                    self.source.stop()
+                    self._set_voice_direction(False)
                 capture_seconds = self._clock() - capture_started
                 if pcm is None:
                     silent_cycles += 1
@@ -482,6 +701,36 @@ class RealtimeVoiceConversation:
                         tool="OpenAI Realtime audio · aplay",
                     )
 
+                def tool_start(name: str, arguments: dict[str, Any]) -> None:
+                    detail = json.dumps(arguments, separators=(",", ":"), ensure_ascii=False)
+                    if len(detail) > 240:
+                        detail = detail[:240] + "…"
+                    self._status(
+                        "step",
+                        "tool",
+                        f"Running robot action {name} with {detail}…",
+                        tool=f"HiBot shared MCP action · {name}",
+                    )
+
+                def tool_result(result: RealtimeToolResult) -> None:
+                    if result.ok:
+                        text = (
+                            f"Robot action {result.name} completed in "
+                            f"{result.elapsed_seconds:.2f} s."
+                        )
+                    else:
+                        text = (
+                            f"Robot action {result.name} failed in "
+                            f"{result.elapsed_seconds:.2f} s: "
+                            f"{result.result.get('error', 'unknown error')}"
+                        )
+                    self._status(
+                        "step",
+                        "thinking",
+                        text,
+                        tool=f"HiBot shared MCP action · {result.name}",
+                    )
+
                 self._status(
                     "step",
                     "thinking",
@@ -494,6 +743,8 @@ class RealtimeVoiceConversation:
                         pcm,
                         on_transcript=publish_transcript,
                         on_first_audio=first_audio,
+                        on_tool_start=tool_start,
+                        on_tool_result=tool_result,
                     )
                 finally:
                     self._set_thinking_leds(False)
@@ -541,6 +792,7 @@ class RealtimeVoiceConversation:
             self.source.stop()
             self.client.close()
             self._set_thinking_leds(False)
+            self._set_voice_direction(False)
             if not failed:
                 self._status("finish", "Voice conversation ended.")
 
@@ -560,3 +812,12 @@ class RealtimeVoiceConversation:
             action()
         except Exception as exc:
             logging.warning("could not update ReSpeaker thinking LEDs: %s", exc)
+
+    def _set_voice_direction(self, active: bool) -> None:
+        action = self.voice_direction_start if active else self.voice_direction_stop
+        if action is None:
+            return
+        try:
+            action()
+        except Exception as exc:
+            logging.warning("could not update ReSpeaker direction LED: %s", exc)

@@ -132,6 +132,7 @@ class WakeWordTests(unittest.TestCase):
         responder = FakeResponder()
         sleeps = []
         wake_calls = []
+        direction_events = []
         listener = WakeWordListener(
             model,
             source,
@@ -139,6 +140,8 @@ class WakeWordTests(unittest.TestCase):
             threshold=0.5,
             cooldown=0.25,
             on_wake=lambda: wake_calls.append("wake"),
+            voice_direction_start=lambda: direction_events.append("direction"),
+            voice_direction_stop=lambda: direction_events.append("off"),
             sleeper=sleeps.append,
         )
 
@@ -148,6 +151,7 @@ class WakeWordTests(unittest.TestCase):
         self.assertEqual(responder.plays, 1)
         self.assertEqual(model.resets, 1)
         self.assertEqual(wake_calls, ["wake"])
+        self.assertEqual(direction_events, ["direction", "off"])
         self.assertEqual(sleeps, [0.25])
         self.assertEqual(source.starts, 1)
         self.assertGreaterEqual(source.stops, 2)
@@ -221,8 +225,10 @@ class WakeWordTests(unittest.TestCase):
             def __init__(self):
                 self.timeouts = []
 
-            def capture(self, _source, *, start_timeout):
+            def capture(self, _source, *, start_timeout, on_speech_start=None):
                 self.timeouts.append(start_timeout)
+                if on_speech_start is not None:
+                    on_speech_start()
                 return pcm_frame(700)
 
         class Chat:
@@ -241,6 +247,7 @@ class WakeWordTests(unittest.TestCase):
         recorder = Recorder()
         chat = Chat()
         spoken = []
+        direction_events = []
         conversation = VoiceConversation(
             source,
             recorder,
@@ -250,6 +257,8 @@ class WakeWordTests(unittest.TestCase):
             followup_timeout=8,
             max_turns=4,
             barge_in=False,
+            voice_direction_start=lambda: direction_events.append("direction"),
+            voice_direction_stop=lambda: direction_events.append("off"),
             settle_seconds=0,
         )
 
@@ -260,6 +269,7 @@ class WakeWordTests(unittest.TestCase):
         self.assertEqual(spoken, ["I can see a cup."])
         self.assertEqual(recorder.timeouts, [10, 8])
         self.assertEqual(source.starts, 2)
+        self.assertEqual(direction_events[:4], ["direction", "off", "direction", "off"])
 
     def test_voice_conversation_starts_fresh_session_and_allows_three_silent_cycles(self):
         source = FakeSource()
@@ -270,7 +280,7 @@ class WakeWordTests(unittest.TestCase):
             def __init__(self):
                 self.timeouts = []
 
-            def capture(self, _source, *, start_timeout):
+            def capture(self, _source, *, start_timeout, on_speech_start=None):
                 self.timeouts.append(start_timeout)
                 return None
 

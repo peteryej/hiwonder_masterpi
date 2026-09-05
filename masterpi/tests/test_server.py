@@ -512,6 +512,16 @@ class ServerTests(unittest.TestCase):
             [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
         )
 
+        status, payload = self.request(
+            "POST", "/api/agent/check_front", {"duration": 0.8}
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(
+            [(item["servo_id"], item["pulse"]) for item in result["servos"]],
+            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+        )
+
     def test_camera_guided_grab_api(self):
         status, payload = self.request("POST", "/api/grab", {"target": "blue"})
         self.assertEqual(status, 200)

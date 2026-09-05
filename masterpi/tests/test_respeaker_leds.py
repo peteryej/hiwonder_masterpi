@@ -1,7 +1,15 @@
+import struct
 import types
 import unittest
 
-from masterpi_control.respeaker_leds import ReSpeakerLedError, spin, turn_off
+from masterpi_control.respeaker_leds import (
+    ReSpeakerLedError,
+    direction_pixel,
+    read_direction,
+    show_direction,
+    spin,
+    turn_off,
+)
 
 
 class FakeDevice:
@@ -19,6 +27,7 @@ class ReSpeakerLedTests(unittest.TestCase):
             core=types.SimpleNamespace(find=lambda **_kwargs: None),
             util=types.SimpleNamespace(
                 CTRL_OUT=0x00,
+                CTRL_IN=0x80,
                 CTRL_TYPE_VENDOR=0x40,
                 CTRL_RECIPIENT_DEVICE=0x00,
                 dispose_resources=self.disposed.append,
@@ -71,6 +80,43 @@ class ReSpeakerLedTests(unittest.TestCase):
                 (0x40, 0, 5, 0x1C, [0], 8000),
             ],
         )
+        self.assertEqual(self.disposed, [device])
+
+    def test_direction_pixel_uses_nearest_thirty_degree_segment(self):
+        self.assertEqual(direction_pixel(0), 0)
+        self.assertEqual(direction_pixel(14.9), 0)
+        self.assertEqual(direction_pixel(15), 1)
+        self.assertEqual(direction_pixel(359), 0)
+        self.assertEqual(direction_pixel(30, clockwise=False), 11)
+
+    def test_show_direction_lights_only_one_custom_pixel(self):
+        device = FakeDevice()
+
+        pixel = show_direction(65, device=device, usb_module=self.usb)
+
+        self.assertEqual(pixel, 2)
+        self.assertEqual(device.calls[0], (0x40, 0, 0x22, 0x1C, [0], 8000))
+        self.assertEqual(device.calls[1], (0x40, 0, 0x20, 0x1C, [8], 8000))
+        custom = device.calls[2]
+        self.assertEqual(custom[:4], (0x40, 0, 6, 0x1C))
+        self.assertEqual(len(custom[4]), 48)
+        self.assertEqual(custom[4][8:12], [0, 180, 60, 0])
+        self.assertEqual(sum(1 for value in custom[4] if value), 2)
+        self.assertEqual(self.disposed, [device])
+
+    def test_read_direction_uses_xvf3000_doa_parameter(self):
+        device = FakeDevice()
+
+        def transfer(*args):
+            device.calls.append(args)
+            return struct.pack("<ii", 123, 0)
+
+        device.ctrl_transfer = transfer
+
+        angle = read_direction(device=device, usb_module=self.usb)
+
+        self.assertEqual(angle, 123.0)
+        self.assertEqual(device.calls, [(0xC0, 0, 0xC0, 21, 8, 8000)])
         self.assertEqual(self.disposed, [device])
 
 

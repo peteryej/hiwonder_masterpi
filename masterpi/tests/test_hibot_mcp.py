@@ -5,6 +5,14 @@ from masterpi_control import hibot_mcp
 
 
 class HibotMcpTests(unittest.TestCase):
+    def test_check_front_uses_shared_exact_pose_action(self):
+        expected = {"pose": "check_front"}
+        with patch.object(hibot_mcp.client, "call", return_value=expected) as call:
+            result = hibot_mcp.check_front()
+
+        self.assertEqual(result, expected)
+        call.assert_called_once_with("check_front", {"duration": 0.8})
+
     def test_drive_for_defaults_to_webpage_chassis_speed(self):
         expected = {"direction": "forward", "speed": 40.0}
         with patch.object(hibot_mcp.client, "call", return_value=expected) as call:

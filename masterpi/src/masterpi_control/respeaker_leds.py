@@ -8,6 +8,8 @@ disabling the VAD LED separately also keeps the center LED dark.
 from __future__ import annotations
 
 import argparse
+import math
+import struct
 import sys
 from typing import Any, Optional, Sequence
 
@@ -18,6 +20,11 @@ USB_TIMEOUT_MS = 8000
 THINKING_PRIMARY = (0, 80, 255)
 THINKING_SECONDARY = (0, 220, 255)
 THINKING_BRIGHTNESS = 8
+VOICE_DIRECTION_COLOR = (0, 180, 60)
+VOICE_DIRECTION_BRIGHTNESS = 8
+RING_PIXELS = 12
+DOA_PARAMETER_ID = 21
+DOA_PARAMETER_OFFSET = 0
 
 
 class ReSpeakerLedError(RuntimeError):
@@ -111,6 +118,99 @@ def spin(
         raise ReSpeakerLedError(
             f"could not start ReSpeaker thinking animation: {exc}"
         ) from exc
+    finally:
+        usb_module.util.dispose_resources(device)
+
+
+def direction_pixel(
+    angle_degrees: float,
+    *,
+    offset_degrees: float = 0,
+    clockwise: bool = True,
+) -> int:
+    """Map a DOA angle to the nearest of the twelve physical ring pixels."""
+
+    if isinstance(angle_degrees, bool) or not isinstance(angle_degrees, (int, float)):
+        raise ReSpeakerLedError("direction angle must be a finite number")
+    angle = float(angle_degrees)
+    offset = float(offset_degrees)
+    if not math.isfinite(angle) or not math.isfinite(offset):
+        raise ReSpeakerLedError("direction angle must be a finite number")
+    normalized = (angle - offset) % 360
+    if not clockwise:
+        normalized = (-normalized) % 360
+    return int((normalized + 15) // 30) % RING_PIXELS
+
+
+def show_direction(
+    angle_degrees: float,
+    device: Any = None,
+    usb_module: Any = None,
+    *,
+    color: tuple[int, int, int] = VOICE_DIRECTION_COLOR,
+    brightness: int = VOICE_DIRECTION_BRIGHTNESS,
+    offset_degrees: float = 0,
+    clockwise: bool = True,
+) -> int:
+    """Light only the ring pixel nearest a ReSpeaker DOA angle."""
+
+    if not isinstance(brightness, int) or not 0 <= brightness <= 31:
+        raise ReSpeakerLedError("LED brightness must be an integer from 0 to 31")
+    pixel = direction_pixel(
+        angle_degrees,
+        offset_degrees=offset_degrees,
+        clockwise=clockwise,
+    )
+    active = _rgb_payload(color)
+    pixels = [0] * (RING_PIXELS * 4)
+    start = pixel * 4
+    pixels[start : start + 4] = active
+    device, usb_module, request_type = _usb_target(device, usb_module)
+    try:
+        device.ctrl_transfer(request_type, 0, 0x22, 0x1C, [0], USB_TIMEOUT_MS)
+        device.ctrl_transfer(
+            request_type, 0, 0x20, 0x1C, [brightness], USB_TIMEOUT_MS
+        )
+        # Command 6 is custom mode: one RGBA tuple per physical ring pixel.
+        device.ctrl_transfer(request_type, 0, 6, 0x1C, pixels, USB_TIMEOUT_MS)
+    except ReSpeakerLedError:
+        raise
+    except Exception as exc:
+        raise ReSpeakerLedError(
+            f"could not show ReSpeaker voice direction: {exc}"
+        ) from exc
+    finally:
+        usb_module.util.dispose_resources(device)
+    return pixel
+
+
+def read_direction(device: Any = None, usb_module: Any = None) -> float:
+    """Read the current raw XVF3000 DOA angle without robot-stack imports."""
+
+    device, usb_module, _ = _usb_target(device, usb_module)
+    request_type = (
+        usb_module.util.CTRL_IN
+        | usb_module.util.CTRL_TYPE_VENDOR
+        | usb_module.util.CTRL_RECIPIENT_DEVICE
+    )
+    try:
+        command = 0x80 | 0x40 | DOA_PARAMETER_OFFSET
+        response = device.ctrl_transfer(
+            request_type,
+            0,
+            command,
+            DOA_PARAMETER_ID,
+            8,
+            USB_TIMEOUT_MS,
+        )
+        angle = int(struct.unpack("<ii", bytes(response))[0])
+        if not 0 <= angle <= 359:
+            raise ReSpeakerLedError(f"ReSpeaker returned invalid DOA angle {angle}")
+        return float(angle)
+    except ReSpeakerLedError:
+        raise
+    except Exception as exc:
+        raise ReSpeakerLedError(f"could not read ReSpeaker voice direction: {exc}") from exc
     finally:
         usb_module.util.dispose_resources(device)
 

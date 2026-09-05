@@ -398,6 +398,9 @@ def make_handler(
                     ),
                     "/api/agent/stop": lambda d: robot.stop(),
                     "/api/agent/home": lambda d: robot.home(d.get("duration", 1.5)),
+                    "/api/agent/check_front": lambda d: robot.check_front(
+                        d.get("duration", 0.8)
+                    ),
                     "/api/agent/nod": lambda d: robot.nod(),
                     "/api/agent/shake": lambda d: robot.shake(),
                     "/api/agent/servo": agent_servo,

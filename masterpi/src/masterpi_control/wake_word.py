@@ -155,6 +155,8 @@ class WakeWordListener:
         threshold: float = 0.5,
         cooldown: float = 0.75,
         on_wake: Optional[Callable[[], None]] = None,
+        voice_direction_start: Optional[Callable[[], None]] = None,
+        voice_direction_stop: Optional[Callable[[], None]] = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not 0 < threshold <= 1:
@@ -167,6 +169,8 @@ class WakeWordListener:
         self.threshold = threshold
         self.cooldown = cooldown
         self.on_wake = on_wake
+        self.voice_direction_start = voice_direction_start
+        self.voice_direction_stop = voice_direction_stop
         self._sleep = sleeper
 
     def run(self, *, max_detections: Optional[int] = None) -> int:
@@ -183,8 +187,12 @@ class WakeWordListener:
                     continue
 
                 logging.info("wake word detected: %s (%.3f)", label, score)
+                self._set_voice_direction(True)
                 self.source.stop()
-                self.responder.play()
+                try:
+                    self.responder.play()
+                finally:
+                    self._set_voice_direction(False)
                 if self.on_wake is not None:
                     self.on_wake()
                 detections += 1
@@ -196,6 +204,19 @@ class WakeWordListener:
         finally:
             self.source.stop()
         return detections
+
+    def _set_voice_direction(self, active: bool) -> None:
+        action = self.voice_direction_start if active else self.voice_direction_stop
+        if action is None:
+            return
+        try:
+            action()
+        except Exception as exc:
+            logging.warning(
+                "could not %s ReSpeaker voice-direction LED: %s",
+                "show" if active else "clear",
+                exc,
+            )
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -460,6 +481,8 @@ class VoiceConversation:
         barge_in_calibration_seconds: float = 0.4,
         thinking_start: Optional[Callable[[], None]] = None,
         thinking_stop: Optional[Callable[[], None]] = None,
+        voice_direction_start: Optional[Callable[[], None]] = None,
+        voice_direction_stop: Optional[Callable[[], None]] = None,
         status: Any = None,
         settle_seconds: float = 0.25,
         sleeper: Callable[[float], None] = time.sleep,
@@ -490,6 +513,8 @@ class VoiceConversation:
         self.barge_in_calibration_seconds = barge_in_calibration_seconds
         self.thinking_start = thinking_start
         self.thinking_stop = thinking_stop
+        self.voice_direction_start = voice_direction_start
+        self.voice_direction_stop = voice_direction_stop
         self.status = status
         self.settle_seconds = settle_seconds
         self._sleep = sleeper
@@ -530,8 +555,15 @@ class VoiceConversation:
                     if self.settle_seconds:
                         self._sleep(self.settle_seconds)
                     self.source.start()
-                    pcm = self.recorder.capture(self.source, start_timeout=timeout)
-                    self.source.stop()
+                    try:
+                        pcm = self.recorder.capture(
+                            self.source,
+                            start_timeout=timeout,
+                            on_speech_start=lambda: self._set_voice_direction(True),
+                        )
+                    finally:
+                        self.source.stop()
+                        self._set_voice_direction(False)
                 if pcm is None:
                     silent_cycles += 1
                     if silent_cycles >= self.max_silent_cycles:
@@ -644,6 +676,7 @@ class VoiceConversation:
             raise
         finally:
             self.source.stop()
+            self._set_voice_direction(False)
             if status_started and not status_failed:
                 self._status_call("finish", end_status)
 
@@ -753,6 +786,19 @@ class VoiceConversation:
             logging.warning(
                 "could not %s ReSpeaker thinking LEDs: %s",
                 "start" if active else "stop",
+                exc,
+            )
+
+    def _set_voice_direction(self, active: bool) -> None:
+        action = self.voice_direction_start if active else self.voice_direction_stop
+        if action is None:
+            return
+        try:
+            action()
+        except Exception as exc:
+            logging.warning(
+                "could not %s ReSpeaker voice-direction LED: %s",
+                "show" if active else "clear",
                 exc,
             )
 
@@ -897,11 +943,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise WakeWordError(f"wake-word response audio was not found: {args.reply_audio}")
         model = build_model(args.model, args.feature_model_dir)
         source = ARecordSource(args.capture_device)
+        from .respeaker_leds import (
+            read_direction,
+            show_direction,
+            turn_off as stop_voice_leds,
+        )
+
+        def start_voice_direction_led() -> None:
+            angle = read_direction()
+            pixel = show_direction(angle)
+            logging.info(
+                "voice direction %.0f degrees -> ReSpeaker LED %d",
+                angle,
+                pixel,
+            )
+
         conversation = None
         if args.conversation:
             from .respeaker_leds import spin as start_thinking_leds
-            from .respeaker_leds import turn_off as stop_thinking_leds
             from .voice_status import VoiceStatusWriter
+
+            stop_thinking_leds = stop_voice_leds
 
             voice_status = VoiceStatusWriter()
             voice_status.idle()
@@ -917,15 +979,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 logging.info("auto-selected %s voice backend", conversation_backend)
             if conversation_backend == "realtime":
+                from .agent_client import HibotAgentClient
                 from .realtime_voice import (
+                    HIBOT_TOOL_REALTIME_PROMPT,
                     OpenAIRealtimeClient,
                     RealtimeVoiceConversation,
                 )
+                from .robot_tools import RobotToolDispatcher
 
                 realtime = OpenAIRealtimeClient.from_environment(
                     args.playback_device,
                     model=args.realtime_model,
                     voice=args.realtime_voice,
+                    instructions=HIBOT_TOOL_REALTIME_PROMPT,
+                    tool_dispatcher=RobotToolDispatcher(HibotAgentClient()),
                 )
                 conversation = RealtimeVoiceConversation(
                     source,
@@ -937,6 +1004,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     max_silent_cycles=args.max_silent_cycles,
                     thinking_start=start_thinking_leds,
                     thinking_stop=stop_thinking_leds,
+                    voice_direction_start=start_voice_direction_led,
+                    voice_direction_stop=stop_voice_leds,
                     status=voice_status,
                 )
             else:
@@ -966,6 +1035,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     barge_in_threshold_multiplier=args.barge_in_threshold_multiplier,
                     thinking_start=start_thinking_leds,
                     thinking_stop=stop_thinking_leds,
+                    voice_direction_start=start_voice_direction_led,
+                    voice_direction_stop=stop_voice_leds,
                     status=voice_status,
                 )
         listener = WakeWordListener(
@@ -975,6 +1046,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             threshold=args.threshold,
             cooldown=args.cooldown,
             on_wake=conversation.run if conversation is not None else None,
+            voice_direction_start=start_voice_direction_led,
+            voice_direction_stop=stop_voice_leds,
         )
         logging.info("listening for wake word with %s", args.model)
         listener.run()

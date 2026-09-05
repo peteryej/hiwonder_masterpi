@@ -12,8 +12,31 @@
 - Added a dedicated HiBot voice prompt that identifies itself as the physical
   Hiwonder MasterPi robot and describes its mecanum chassis, arm, gripper camera,
   ultrasonic sensor, LEDs, buzzer, ReSpeaker, and supported actions. It limits
-  normal answers to one or two sentences and explicitly says this no-Hermes
-  voice path has no control tools, preventing false claims that an action ran.
+  normal answers to one or two sentences and requires a confirmed tool result
+  before claiming that a physical action succeeded.
+- Added robot actions directly to the Realtime session without reconnecting the
+  Hermes agent. A shared registry now supplies OpenAI function schemas and the
+  MCP wrappers, while both dispatch through the existing loopback-only,
+  validated `/api/agent/*` controller. Realtime handles complete function-call
+  rounds (`function_call` → local action → `function_call_output` → final spoken
+  response), caps a turn at four tool rounds, and reports each action and its
+  elapsed time in the webpage voice feed.
+- Exposed `check_front` consistently through MCP, Realtime, and
+  `/api/agent/check_front`. `recognize_and_grab` retains the requested
+  unconditional front pickup with no color guardrail. Large annotated camera
+  image data is omitted from the model's tool-result context while semantic
+  detections remain available, avoiding unnecessary latency and context use.
+- Replaced the agent client's universal 15-second HTTP deadline with an
+  action-aware timeout: bounded motor/sensor commands retain 15 seconds, while
+  semantic `camera_analyze` gets 180 seconds for arm settling and Hermes vision.
+  Timeout errors now identify both the action and applied limit.
+- Added a single-pixel ReSpeaker voice-direction indicator. When openWakeWord
+  detects **Hello HiBot**, or the conversation recorder confirms speech, the
+  service reads the XVF3000 `DOAANGLE`, rounds it to the nearest of the twelve
+  30-degree ring segments, and uses USB LED custom mode to light only that
+  pixel in low-brightness green. The pixel is cleared after capture; the
+  existing blue/cyan rotating animation still takes over while HiBot thinks.
+  LED/DOA failures remain non-fatal to the voice conversation.
 - Kept input/output transcripts and connecting, listening, thinking, streaming,
   completion, and error stages in the webpage conversation feed. Each completed
   turn now displays capture, end-of-speech-to-first-audio, and complete-stream
@@ -39,19 +62,18 @@
 - Added a file-backed live voice-conversation feed shared by the wake service
   and web controller. It records the wake, **I'm here**, user transcripts,
   intermediate listening/transcribing/thinking/speaking stages, the responsible
-  tool or subsystem when available, Hermes replies, interruptions, stop/silence
+  tool or subsystem when available, HiBot replies, interruptions, stop/silence
   exits, and errors.
 - Added `GET /api/voice/conversation` and connected the webpage chat log to it.
   The page now shows spoken conversations alongside typed chat, polls live while
-  Hermes works, renders an animated thinking bubble, and displays tool-stage
-  details without inventing internal Hermes tool calls that its quiet CLI does
-  not expose.
+  the voice backend works, renders an animated thinking bubble, and displays
+  tool-stage details reported by the active backend.
 - The typed web chat now uses the same animated thinking bubble while awaiting
   its response.
 
 ## Verification
 
-- Full test suite: 113 tests passing.
+- Full test suite: 124 tests passing.
 - Python bytecode compilation and `git diff --check`: passing.
 - Installed and restarted the direct-Realtime wake listener; systemd reports it
   active with zero restarts and an explicit `--conversation-backend realtime`
@@ -59,6 +81,14 @@
 - A real Realtime audio-in/audio-out smoke test sent the existing 1.776-second
   **“I'm here”** WAV, received the correct transcript, and audibly streamed a
   five-second HiBot reply through the ReSpeaker output.
+- A live direct-Realtime tool test explicitly requested the read-only
+  `get_state` action. The model selected only `get_state`, the loopback
+  controller returned successfully in 0.008 seconds, and the model correctly
+  answered that the chassis was stopped. No movement tool was called.
+- A live `camera_analyze` retry completed in 23.471 seconds, beyond the former
+  15-second deadline but comfortably inside the new 180-second limit. It moved
+  to Check front, returned five semantic object detections, and included the
+  annotated image.
 - A direct Hermes smoke test successfully answered **“What can you do?”** using
   the same chat integration. Live wake-to-answer and browser rendering remain
   to be physically checked with the microphone and browser.
@@ -70,6 +100,13 @@
   the main remaining latency. Hermes CLI startup measured 1.13 seconds.
 - ReSpeaker thinking-ring writes remain non-fatal but still require the udev
   permission update documented below.
+- The direction-pixel hardware smoke test correctly attempted custom LED mode
+  but the current `/etc/udev/rules.d/99-respeaker-led-off.rules` was confirmed
+  to be the older LED-off-only copy: active USB node `2886:0018` remains
+  `root:root` and PyUSB returns `Access denied`. Installing the repository rule
+  needs the Pi's interactive sudo password; the attempted passwordless install
+  was rejected. After installation/reload, reconnect or trigger the device and
+  physically verify the native raw-angle orientation.
 
 ## Measured voice latency
 
@@ -103,6 +140,16 @@ wall-clock turn was 5.973 seconds, and the returned input transcript was
 correct. A separate initial authentication/schema probe took 1.639 seconds;
 subsequent connections were faster. The persistent connection is reused for
 all follow-up turns after each wake.
+
+The first live Realtime tool round used text input and suppressed speaker
+playback so it could not retrigger the microphone:
+
+| Tool-enabled Realtime stage | Elapsed time |
+| --- | ---: |
+| Committed request to first returned audio | 0.714 s |
+| Read-only `get_state` controller call | 0.008 s |
+| Request through final `response.done` | 3.224 s |
+| Generated reply audio duration | 10.550 s |
 
 For comparison, the previous serialized Hermes pipeline measured:
 
@@ -153,6 +200,8 @@ query timeout, while the measured Hermes turn alone takes 35–39 seconds. The
 direct Realtime `voice` mode is the useful reference. Robot actions should be
 exposed as narrow worker tools or mapped from the existing reliable
 `send_client_action` channel to MasterPi's bounded `/api/agent/*` endpoints.
+That mapping is now implemented directly in the persistent Realtime session;
+Hermes remains outside the fast voice path.
 
 ### Direct Realtime remaining TODO
 
