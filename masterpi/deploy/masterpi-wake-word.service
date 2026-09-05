@@ -12,7 +12,7 @@ WorkingDirectory=/home/pi/projs/hiwonder_masterpi/masterpi
 Environment=PYTHONPATH=/home/pi/projs/hiwonder_masterpi/masterpi/src
 Environment=HOME=/home/pi
 Environment=MASTERPI_HERMES_BIN=/home/pi/.local/bin/hermes
-ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.wakeword-venv/bin/python -m masterpi_control.wake_word --conversation --threshold 0.5
+ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.wakeword-venv/bin/python -m masterpi_control.wake_word --conversation --threshold 0.5 --speech-threshold 200 --speech-silence 3 --speech-start-timeout 15 --followup-timeout 15 --max-utterance 120 --conversation-max-turns 30 --max-silent-cycles 3 --no-barge-in
 Restart=on-failure
 RestartSec=2
 

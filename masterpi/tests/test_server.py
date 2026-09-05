@@ -1,8 +1,10 @@
 import json
+import tempfile
 import threading
 import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 import cv2
@@ -11,6 +13,7 @@ import numpy as np
 from masterpi_control.backends import MockBackend
 from masterpi_control.robot import Robot
 from masterpi_control.server import make_handler
+from masterpi_control.voice_status import VoiceStatusWriter
 
 
 class FakeCamera:
@@ -114,6 +117,14 @@ class ServerTests(unittest.TestCase):
         self.chat = FakeChat()
         self.vision_grasper = FakeVisionGrasper()
         self.sound_tracker = FakeSoundTracker()
+        self.temp_directory = tempfile.TemporaryDirectory()
+        self.voice_status_path = Path(self.temp_directory.name) / "voice.json"
+        self.voice_status = VoiceStatusWriter(self.voice_status_path)
+        self.voice_status.begin("test-voice-session")
+        self.voice_status.message("user", "What can you do?")
+        self.voice_status.step(
+            "thinking", "Hermes is thinking…", tool="Hermes Agent · safe toolset"
+        )
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
             make_handler(
@@ -123,6 +134,7 @@ class ServerTests(unittest.TestCase):
                 b"test-masterpi-ca",
                 self.vision_grasper,
                 self.sound_tracker,
+                self.voice_status_path,
             ),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -133,6 +145,7 @@ class ServerTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=1)
         self.robot.close()
+        self.temp_directory.cleanup()
 
     def request(self, method, path, body=None):
         connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
@@ -203,7 +216,7 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn(b'id="voiceDetected"', page)
         self.assertNotIn(b'id="voicePhrase"', page)
         self.assertNotIn(b'id="speakVoice"', page)
-        self.assertNotIn(b"/api/voice", page)
+        self.assertNotIn(b"/api/voice/speak", page)
         self.assertNotIn(b"Reconnect camera", page)
         self.assertIn(b"Direct servo control", page)
         self.assertEqual(page.count(b'class="servo-slider"'), 5)
@@ -263,6 +276,22 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b"Action completed:", page)
         self.assertIn(b"body.result.vision?.annotated_image", page)
         self.assertIn(b"chat-vision-image", page)
+        self.assertIn(b"/api/voice/conversation", page)
+        self.assertIn(b"hibot is thinking", page)
+        self.assertIn(b"Tool:", page)
+        self.assertIn(b"thinking-dots", page)
+
+    def test_voice_conversation_status_api_returns_transcript_and_thinking_stage(self):
+        status, payload = self.request("GET", "/api/voice/conversation")
+
+        self.assertEqual(status, 200)
+        body = json.loads(payload)
+        self.assertTrue(body["ok"])
+        conversation = body["conversation"]
+        self.assertEqual(conversation["session"], "test-voice-session")
+        self.assertEqual(conversation["state"], "thinking")
+        self.assertEqual(conversation["events"][-2]["text"], "What can you do?")
+        self.assertEqual(conversation["events"][-1]["tool"], "Hermes Agent · safe toolset")
 
     def test_text_chat_api_returns_hibot_reply(self):
         status, payload = self.request(

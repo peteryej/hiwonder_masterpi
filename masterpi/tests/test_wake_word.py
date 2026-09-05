@@ -11,6 +11,7 @@ from masterpi_control.wake_word import (
     ARecordSource,
     FRAME_BYTES,
     FRAME_SAMPLES,
+    HermesReplySpeaker,
     UtteranceRecorder,
     VoiceConversation,
     WakeWordError,
@@ -190,6 +191,8 @@ class WakeWordTests(unittest.TestCase):
                 pcm_frame(0),
                 pcm_frame(900),
                 pcm_frame(900),
+                pcm_frame(900),
+                pcm_frame(900),
                 pcm_frame(800),
                 pcm_frame(0),
                 pcm_frame(0),
@@ -246,6 +249,7 @@ class WakeWordTests(unittest.TestCase):
             initial_timeout=10,
             followup_timeout=8,
             max_turns=4,
+            barge_in=False,
             settle_seconds=0,
         )
 
@@ -253,9 +257,152 @@ class WakeWordTests(unittest.TestCase):
 
         self.assertTrue(chat.assert_wav)
         self.assertEqual(chat.messages, ["What can you see?"])
-        self.assertEqual(spoken, ["I can see a cup.", "Goodbye."])
+        self.assertEqual(spoken, ["I can see a cup."])
         self.assertEqual(recorder.timeouts, [10, 8])
         self.assertEqual(source.starts, 2)
+
+    def test_voice_conversation_starts_fresh_session_and_allows_three_silent_cycles(self):
+        source = FakeSource()
+
+        class Recorder:
+            speech_threshold = 200
+
+            def __init__(self):
+                self.timeouts = []
+
+            def capture(self, _source, *, start_timeout):
+                self.timeouts.append(start_timeout)
+                return None
+
+        class Chat:
+            def __init__(self):
+                self.sessions = 0
+
+            def new_session(self):
+                self.sessions += 1
+                return "hibot-voice-new"
+
+        recorder = Recorder()
+        chat = Chat()
+        conversation = VoiceConversation(
+            source,
+            recorder,
+            chat,
+            lambda _text: None,
+            initial_timeout=15,
+            followup_timeout=15,
+            max_silent_cycles=3,
+            barge_in=False,
+            settle_seconds=0,
+        )
+
+        conversation.run()
+
+        self.assertEqual(chat.sessions, 1)
+        self.assertEqual(recorder.timeouts, [15, 15, 15])
+        self.assertEqual(source.starts, 3)
+        self.assertGreaterEqual(source.stops, 3)
+
+    def test_generation_barge_in_cancels_hermes_and_returns_audio(self):
+        source = FakeSource()
+        interruption = pcm_frame(800)
+
+        class Recorder:
+            speech_threshold = 200
+
+            def calibrate(self, _source, *, seconds):
+                self.calibration_seconds = seconds
+                return 50
+
+            def capture(self, _source, **kwargs):
+                self.threshold = kwargs["speech_threshold"]
+                kwargs["on_speech_start"]()
+                return interruption
+
+        class Chat:
+            def reply_interruptible(self, _message, cancel):
+                cancel.wait(1)
+                from masterpi_control.chat import ChatInterrupted
+
+                raise ChatInterrupted("interrupted")
+
+        recorder = Recorder()
+        led_events = []
+        conversation = VoiceConversation(
+            source,
+            recorder,
+            Chat(),
+            lambda _text: None,
+            barge_in=True,
+            thinking_start=lambda: led_events.append("spin"),
+            thinking_stop=lambda: led_events.append("off"),
+            settle_seconds=0,
+        )
+
+        reply, pcm, threshold = conversation._reply("hello")
+
+        self.assertEqual(reply, "")
+        self.assertEqual(pcm, interruption)
+        self.assertEqual(threshold, 500)
+        self.assertEqual(recorder.threshold, 500)
+        self.assertEqual(led_events, ["spin", "off"])
+
+    def test_playback_barge_in_stops_aplay_and_returns_audio(self):
+        interruption = pcm_frame(800)
+
+        class Chat:
+            def synthesize(self, _text):
+                return b"audio", "audio/mpeg"
+
+        class Recorder:
+            def capture(self, _source, **kwargs):
+                kwargs["on_speech_start"]()
+                return interruption
+
+        class Playback:
+            def __init__(self):
+                self.stderr = io.StringIO()
+                self.running = True
+                self.terminated = False
+
+            def poll(self):
+                return None if self.running else 0
+
+            def terminate(self):
+                self.terminated = True
+                self.running = False
+
+            def wait(self, timeout=None):
+                self.running = False
+                return 0
+
+            def kill(self):
+                self.running = False
+
+        playback = Playback()
+
+        def runner(_command, **_kwargs):
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        speaker = HermesReplySpeaker(
+            Chat(),
+            runner=runner,
+            popen=lambda *_args, **_kwargs: playback,
+            barge_in_grace_seconds=0,
+        )
+        source = FakeSource()
+
+        pcm = speaker.speak_interruptible(
+            "Hello",
+            source,
+            Recorder(),
+            speech_threshold=200,
+        )
+
+        self.assertEqual(pcm, interruption)
+        self.assertTrue(playback.terminated)
+        self.assertEqual(source.starts, 1)
+        self.assertEqual(source.stops, 1)
 
 
 if __name__ == "__main__":

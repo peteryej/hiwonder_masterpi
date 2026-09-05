@@ -175,7 +175,7 @@ has no Python 3.13 Raspberry Pi wheel. Keep it isolated in the installed Python
 ```bash
 cd /home/pi/projs/hiwonder_masterpi
 /home/pi/.local/bin/python3.11 -m venv masterpi/.wakeword-venv
-masterpi/.wakeword-venv/bin/pip install openwakeword==0.6.0
+masterpi/.wakeword-venv/bin/pip install openwakeword==0.6.0 'pyusb>=1.3,<2'
 PYTHONPATH=masterpi/src masterpi/.wakeword-venv/bin/python \
   -m masterpi_control.wake_word --download-features
 ```
@@ -207,18 +207,50 @@ listening again. Start with the default `0.5` score threshold. Raise it with
 `--threshold 0.6` if normal conversation causes false activations, or lower it
 slightly if the phrase is missed.
 
-With `--conversation`, wake detection plays **I'm here**, waits up to ten
-seconds for speech, records until one second of silence, sends the WAV to
-Hermes speech-to-text, continues the persistent `hibot-voice` agent session,
-and speaks the reply through the ReSpeaker output. After each reply it accepts
-a follow-up for eight seconds without requiring the wake phrase again. It
-returns to wake-word mode after silence, six turns, or an explicit **goodbye**,
-**stop listening**, **that's all**, or **end conversation**.
+With `--conversation`, each wake creates a fresh `hibot-voice-*` Hermes session
+and plays **I'm here**. Speech must remain above RMS 200 for four 80 ms frames
+before it is accepted; recording then ends after three seconds of silence. The
+service sends each WAV to Hermes speech-to-text, speaks the reply through the
+ReSpeaker output, and listens for follow-ups without requiring the wake phrase
+again. Hermes' voice-mode transcription wrapper filters common Whisper
+hallucinations, treating filtered or empty results as silence. Three
+consecutive 15-second silent cycles, 30 user turns, or an exact
+**stop**, **goodbye**, **never mind**, **cancel**, **stop listening**, **that's
+all**, or **end conversation** returns it to wake-word mode.
+
+Robot voice conversations explicitly use the fast `gpt-5.6-luna` model through
+the `openai-codex` provider with low reasoning effort. This override is scoped
+to the wake-word service; typed web chat and other Hermes channels continue to
+use their own configured model. The agent toolset remains `safe` so the robot's
+configured hibot MCP actions are still available.
+
+Barge-in is disabled in the installed service. While Hermes is thinking or the
+robot is speaking, finish waiting for the reply before asking the next
+question. This avoids false interruption from room noise or speaker leakage.
+The implementation still supports opt-in `--barge-in`; when enabled it samples
+the quiet-room floor and uses the larger of RMS 500 or three times that floor.
+Normal initial speech detection remains at RMS 200.
+
+The controller's **Chat with hibot** panel also displays the current spoken
+conversation. It shows what STT heard, Hermes' reply, an animated thinking
+indicator, and intermediate listening, transcription, agent, TTS, playback,
+interruption, and error stages. Each stage identifies the tool or subsystem
+when that information is available. The page reads the wake service's atomic
+status snapshot through `GET /api/voice/conversation`; Hermes is run in quiet
+reply mode, so internal agent tool calls that Hermes does not emit are not
+guessed or displayed.
+
+While Hermes is processing a submitted question, the ReSpeaker runs its
+built-in clockwise spin animation with a low-brightness blue/cyan palette. The
+ring is returned to mono black before reply playback, on interruption, and on
+every error path. Dynamic control runs in the unprivileged wake-word service,
+so the installed udev rule must be the repository version that assigns the
+device to `plugdev`; after updating the rule, reconnect the array or reboot.
 
 Only wake detection is fully local. Spoken conversations use Hermes' configured
 STT, agent model, and TTS providers, so those providers must be configured and
 may require network access. If room noise starts recordings, raise
-`--speech-threshold 300`; lower it if normal speech is not captured.
+`--speech-threshold`; lower it if normal speech is not captured.
 
 After foreground testing succeeds, install the included service:
 

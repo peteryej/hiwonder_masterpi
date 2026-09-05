@@ -8,6 +8,7 @@ import logging
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import wave
@@ -17,7 +18,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .chat import ChatError
+from .chat import ChatError, ChatInterrupted, NoSpeechDetected
 
 
 SAMPLE_RATE = 16_000
@@ -216,7 +217,7 @@ class UtteranceRecorder:
         speech_threshold: float = 300,
         silence_seconds: float = 1.0,
         max_seconds: float = 20,
-        speech_start_frames: int = 2,
+        speech_start_frames: int = 4,
         pre_roll_seconds: float = 0.4,
     ) -> None:
         if not 0 < speech_threshold <= 32_767:
@@ -238,9 +239,27 @@ class UtteranceRecorder:
         samples = np.frombuffer(frame, dtype="<i2").astype(np.float64)
         return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
 
-    def capture(self, source: ARecordSource, *, start_timeout: float) -> Optional[bytes]:
+    def calibrate(self, source: ARecordSource, *, seconds: float = 0.4) -> float:
+        """Measure the quiet-room RMS before reply audio starts."""
+
+        frame_count = max(1, round(seconds / 0.08))
+        levels = [self._rms(source.read()) for _ in range(frame_count)]
+        return float(np.median(levels))
+
+    def capture(
+        self,
+        source: ARecordSource,
+        *,
+        start_timeout: float,
+        stop_when: Optional[Callable[[], bool]] = None,
+        speech_threshold: Optional[float] = None,
+        on_speech_start: Optional[Callable[[], None]] = None,
+    ) -> Optional[bytes]:
         if not 0 < start_timeout <= 120:
             raise WakeWordError("speech start timeout must be greater than 0 and at most 120 seconds")
+        threshold = self.speech_threshold if speech_threshold is None else speech_threshold
+        if not 0 < threshold <= 32_767:
+            raise WakeWordError("speech threshold must be greater than 0 and at most 32767")
         start_limit = max(1, round(start_timeout / 0.08))
         pre_roll: deque[bytes] = deque(maxlen=self.pre_roll_frames)
         frames: list[bytes] = []
@@ -250,11 +269,15 @@ class UtteranceRecorder:
             frame = source.read()
             pre_roll.append(frame)
             rms = self._rms(frame)
-            consecutive_speech = consecutive_speech + 1 if rms >= self.speech_threshold else 0
+            consecutive_speech = consecutive_speech + 1 if rms >= threshold else 0
             if consecutive_speech >= self.speech_start_frames:
                 frames.extend(pre_roll)
                 logging.info("speech started (RMS %.0f)", rms)
+                if on_speech_start is not None:
+                    on_speech_start()
                 break
+            if stop_when is not None and stop_when():
+                return None
         else:
             return None
 
@@ -262,7 +285,7 @@ class UtteranceRecorder:
         for _ in range(max(0, self.max_frames - len(frames))):
             frame = source.read()
             frames.append(frame)
-            if self._rms(frame) < self.speech_threshold:
+            if self._rms(frame) < threshold:
                 consecutive_silence += 1
                 if consecutive_silence >= self.silence_frames:
                     break
@@ -280,51 +303,138 @@ class HermesReplySpeaker:
         playback_device: str = DEFAULT_PLAYBACK_DEVICE,
         *,
         runner: Callable[..., Any] = subprocess.run,
+        popen: Callable[..., Any] = subprocess.Popen,
+        barge_in_grace_seconds: float = 0.5,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.chat = chat
         self.playback_device = playback_device
         self._runner = runner
+        self._popen = popen
+        if not 0 <= barge_in_grace_seconds <= 5:
+            raise WakeWordError("barge-in grace must be between 0 and 5 seconds")
+        self.barge_in_grace_seconds = barge_in_grace_seconds
+        self._sleep = sleeper
 
-    def __call__(self, text: str) -> None:
+    def _convert_reply(self, text: str, directory: str) -> Path:
         audio, content_type = self.chat.synthesize(text)
         suffix = ".ogg" if content_type.partition(";")[0] == "audio/ogg" else ".mp3"
+        source = Path(directory) / f"reply{suffix}"
+        output = Path(directory) / "reply.wav"
+        source.write_bytes(audio)
+        try:
+            completed = self._runner(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-ar",
+                    str(SAMPLE_RATE),
+                    "-ac",
+                    "1",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+            )
+        except OSError as exc:
+            raise WakeWordError(f"could not convert Hermes reply audio: {exc}") from exc
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise WakeWordError(detail or "Hermes reply audio conversion failed")
+        return output
+
+    def __call__(self, text: str) -> None:
         with tempfile.TemporaryDirectory(prefix="masterpi-voice-") as directory:
-            source = Path(directory) / f"reply{suffix}"
-            output = Path(directory) / "reply.wav"
-            source.write_bytes(audio)
+            output = self._convert_reply(text, directory)
+            APlayResponder(output, self.playback_device, runner=self._runner).play()
+
+    def speak_interruptible(
+        self,
+        text: str,
+        source: ARecordSource,
+        recorder: UtteranceRecorder,
+        *,
+        speech_threshold: float,
+    ) -> Optional[bytes]:
+        """Play a reply while listening for echo-cancelled user speech."""
+
+        with tempfile.TemporaryDirectory(prefix="masterpi-voice-") as directory:
+            output = self._convert_reply(text, directory)
             try:
-                completed = self._runner(
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-i",
-                        str(source),
-                        "-ar",
-                        str(SAMPLE_RATE),
-                        "-ac",
-                        "1",
-                        str(output),
-                    ],
+                process = self._popen(
+                    ["aplay", "-q", "-D", self.playback_device, str(output)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    capture_output=True,
                 )
             except OSError as exc:
-                raise WakeWordError(f"could not convert Hermes reply audio: {exc}") from exc
-            if completed.returncode:
-                detail = completed.stderr.strip() or completed.stdout.strip()
-                raise WakeWordError(detail or "Hermes reply audio conversion failed")
-            APlayResponder(output, self.playback_device, runner=self._runner).play()
+                raise WakeWordError(f"could not play Hermes reply: {exc}") from exc
+
+            if self.barge_in_grace_seconds:
+                self._sleep(self.barge_in_grace_seconds)
+            if process.poll() is not None:
+                self._check_playback(process)
+                return None
+
+            def stop_playback() -> None:
+                if process.poll() is None:
+                    process.terminate()
+
+            source.start()
+            try:
+                pcm = recorder.capture(
+                    source,
+                    start_timeout=120,
+                    stop_when=lambda: process.poll() is not None,
+                    speech_threshold=speech_threshold,
+                    on_speech_start=stop_playback,
+                )
+            finally:
+                source.stop()
+
+            if pcm is not None:
+                stop_playback()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+                return pcm
+            self._check_playback(process)
+            return None
+
+    @staticmethod
+    def _check_playback(process: Any) -> None:
+        returncode = process.wait(timeout=2)
+        if returncode:
+            detail = ""
+            if process.stderr is not None:
+                detail = process.stderr.read()
+                if isinstance(detail, bytes):
+                    detail = detail.decode(errors="replace")
+                detail = detail.strip()
+            raise WakeWordError(detail or "Hermes reply playback failed")
 
 
 class VoiceConversation:
     """Run a short multi-turn spoken conversation through Hermes Agent."""
 
+    INTERRUPTION_NOTE = (
+        "[The user interrupted the previous response while it was being generated or spoken. "
+        "Respond to their new request instead.] "
+    )
+
     EXIT_PHRASES = {
         "bye",
+        "cancel",
         "goodbye",
+        "never mind",
+        "stop",
         "stop listening",
         "that's all",
         "that is all",
@@ -341,11 +451,27 @@ class VoiceConversation:
         initial_timeout: float = 10,
         followup_timeout: float = 8,
         max_turns: int = 6,
+        max_silent_cycles: int = 3,
+        barge_in: bool = True,
+        barge_in_min_threshold: float = 500,
+        barge_in_threshold_multiplier: float = 3.0,
+        barge_in_calibration_seconds: float = 0.4,
+        thinking_start: Optional[Callable[[], None]] = None,
+        thinking_stop: Optional[Callable[[], None]] = None,
+        status: Any = None,
         settle_seconds: float = 0.25,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not 1 <= max_turns <= 30:
             raise WakeWordError("conversation max turns must be between 1 and 30")
+        if not 1 <= max_silent_cycles <= 10:
+            raise WakeWordError("silent cycle limit must be between 1 and 10")
+        if not 1 <= barge_in_min_threshold <= 32_767:
+            raise WakeWordError("minimum barge-in threshold must be between 1 and 32767")
+        if not 1 <= barge_in_threshold_multiplier <= 20:
+            raise WakeWordError("barge-in threshold multiplier must be between 1 and 20")
+        if not 0.08 <= barge_in_calibration_seconds <= 5:
+            raise WakeWordError("barge-in calibration must be between 0.08 and 5 seconds")
         if not 0 <= settle_seconds <= 5:
             raise WakeWordError("conversation settle time must be between 0 and 5 seconds")
         self.source = source
@@ -355,6 +481,14 @@ class VoiceConversation:
         self.initial_timeout = initial_timeout
         self.followup_timeout = followup_timeout
         self.max_turns = max_turns
+        self.max_silent_cycles = max_silent_cycles
+        self.barge_in = barge_in
+        self.barge_in_min_threshold = barge_in_min_threshold
+        self.barge_in_threshold_multiplier = barge_in_threshold_multiplier
+        self.barge_in_calibration_seconds = barge_in_calibration_seconds
+        self.thinking_start = thinking_start
+        self.thinking_stop = thinking_stop
+        self.status = status
         self.settle_seconds = settle_seconds
         self._sleep = sleeper
 
@@ -365,31 +499,260 @@ class VoiceConversation:
 
     def run(self) -> None:
         timeout = self.initial_timeout
+        pending_pcm: Optional[bytes] = None
+        silent_cycles = 0
+        turns = 0
+        previous_reply_interrupted = False
+        status_started = False
+        status_failed = False
+        end_status = "Voice conversation ended."
         try:
-            for _ in range(self.max_turns):
-                if self.settle_seconds:
-                    self._sleep(self.settle_seconds)
-                self.source.start()
-                pcm = self.recorder.capture(self.source, start_timeout=timeout)
-                self.source.stop()
+            session_name = f"hibot-voice-{int(time.time())}"
+            new_session = getattr(self.chat, "new_session", None)
+            if callable(new_session):
+                session_name = new_session()
+                logging.info("started fresh Hermes voice session: %s", session_name)
+            self._status_call("begin", session_name)
+            status_started = True
+            self._status_call("message", "hibot", "I'm here.")
+
+            while turns < self.max_turns:
+                pcm, pending_pcm = pending_pcm, None
                 if pcm is None:
-                    logging.info("voice conversation ended after %.1f seconds without speech", timeout)
-                    return
+                    self._status_call(
+                        "step",
+                        "listening",
+                        "Listening for your question…",
+                        tool="ALSA · ReSpeaker USB 4 Mic Array",
+                    )
+                    if self.settle_seconds:
+                        self._sleep(self.settle_seconds)
+                    self.source.start()
+                    pcm = self.recorder.capture(self.source, start_timeout=timeout)
+                    self.source.stop()
+                if pcm is None:
+                    silent_cycles += 1
+                    if silent_cycles >= self.max_silent_cycles:
+                        logging.info(
+                            "voice conversation ended after %d silent cycles",
+                            silent_cycles,
+                        )
+                        end_status = "Voice conversation ended after no speech was heard."
+                        return
+                    self._status_call(
+                        "step",
+                        "listening",
+                        f"No speech heard ({silent_cycles}/{self.max_silent_cycles}); listening again…",
+                        tool="Voice activity detector",
+                    )
+                    timeout = self.followup_timeout
+                    continue
 
-                transcript = self.chat.transcribe(pcm_to_wav(pcm), "audio/wav")
+                silent_cycles = 0
+                self._status_call(
+                    "step",
+                    "transcribing",
+                    "Transcribing your speech…",
+                    tool="Hermes voice STT · local faster-whisper base",
+                )
+                try:
+                    transcript = self.chat.transcribe(pcm_to_wav(pcm), "audio/wav")
+                except NoSpeechDetected:
+                    silent_cycles += 1
+                    if silent_cycles >= self.max_silent_cycles:
+                        logging.info(
+                            "voice conversation ended after %d silent STT cycles",
+                            silent_cycles,
+                        )
+                        end_status = "Voice conversation ended after no speech was recognized."
+                        return
+                    self._status_call(
+                        "step",
+                        "listening",
+                        f"No words recognized ({silent_cycles}/{self.max_silent_cycles}); listening again…",
+                        tool="Hermes voice STT",
+                    )
+                    timeout = self.followup_timeout
+                    continue
                 logging.info("user: %s", transcript)
+                self._status_call("message", "user", transcript)
                 if self._is_exit(transcript):
-                    self.speaker("Goodbye.")
+                    logging.info("voice conversation ended by stop phrase")
+                    end_status = "Voice conversation ended by your stop phrase."
                     return
 
-                reply = self.chat.reply(transcript)
+                turns += 1
+                message = (
+                    self.INTERRUPTION_NOTE + transcript
+                    if previous_reply_interrupted
+                    else transcript
+                )
+                previous_reply_interrupted = False
+                self._status_call(
+                    "step",
+                    "thinking",
+                    "Hermes is thinking…",
+                    tool=self._agent_status_label(),
+                )
+                reply, pending_pcm, barge_threshold = self._reply(message)
+                if pending_pcm is not None:
+                    previous_reply_interrupted = True
+                    self._status_call(
+                        "step",
+                        "interrupted",
+                        "You interrupted Hermes while it was thinking; transcribing the new request…",
+                        tool="Voice activity detector · barge-in",
+                    )
+                    timeout = self.followup_timeout
+                    continue
                 logging.info("hibot: %s", reply)
-                self.speaker(reply)
+                self._status_call("message", "hibot", reply)
+                self._status_call(
+                    "step",
+                    "speaking",
+                    "Generating and playing the spoken reply…",
+                    tool="Hermes TTS · Edge TTS + aplay",
+                )
+                speak_interruptible = getattr(self.speaker, "speak_interruptible", None)
+                if self.barge_in and callable(speak_interruptible):
+                    pending_pcm = speak_interruptible(
+                        reply,
+                        self.source,
+                        self.recorder,
+                        speech_threshold=barge_threshold,
+                    )
+                    previous_reply_interrupted = pending_pcm is not None
+                else:
+                    self.speaker(reply)
+                if pending_pcm is not None:
+                    self._status_call(
+                        "step",
+                        "interrupted",
+                        "You interrupted the spoken reply; transcribing the new request…",
+                        tool="Voice activity detector · barge-in",
+                    )
                 timeout = self.followup_timeout
         except ChatError as exc:
             logging.error("Hermes voice conversation failed: %s", exc)
+            status_failed = True
+            self._status_call("error", f"Hermes voice conversation failed: {exc}")
+        except Exception as exc:
+            status_failed = True
+            self._status_call("error", f"Voice conversation failed: {exc}")
+            raise
         finally:
             self.source.stop()
+            if status_started and not status_failed:
+                self._status_call("finish", end_status)
+
+    def _reply(self, transcript: str) -> tuple[str, Optional[bytes], float]:
+        if not self.barge_in:
+            self._set_thinking_leds(True)
+            try:
+                return self.chat.reply(transcript), None, getattr(
+                    self.recorder, "speech_threshold", 200
+                )
+            finally:
+                self._set_thinking_leds(False)
+
+        self.source.start()
+        try:
+            quiet_floor = self.recorder.calibrate(
+                self.source,
+                seconds=self.barge_in_calibration_seconds,
+            )
+            threshold = min(
+                32_767,
+                max(
+                    self.recorder.speech_threshold,
+                    self.barge_in_min_threshold,
+                    quiet_floor * self.barge_in_threshold_multiplier,
+                ),
+            )
+            logging.info(
+                "barge-in calibrated: floor %.0f, threshold %.0f",
+                quiet_floor,
+                threshold,
+            )
+            cancel = threading.Event()
+            done = threading.Event()
+            result: dict[str, str] = {}
+            failure: list[Exception] = []
+
+            def ask_hermes() -> None:
+                try:
+                    interruptible = getattr(self.chat, "reply_interruptible", None)
+                    if callable(interruptible):
+                        result["reply"] = interruptible(transcript, cancel)
+                    else:
+                        result["reply"] = self.chat.reply(transcript)
+                except Exception as exc:
+                    failure.append(exc)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=ask_hermes, daemon=True)
+            self._set_thinking_leds(True)
+            worker.start()
+            pcm = self.recorder.capture(
+                self.source,
+                start_timeout=120,
+                stop_when=done.is_set,
+                speech_threshold=threshold,
+                on_speech_start=cancel.set,
+            )
+            if pcm is not None:
+                cancel.set()
+                worker.join(timeout=10)
+                if worker.is_alive():
+                    raise ChatError("Hermes Agent did not stop after voice interruption")
+                unexpected = [exc for exc in failure if not isinstance(exc, ChatInterrupted)]
+                if unexpected:
+                    raise unexpected[0]
+                logging.info("Hermes reply interrupted while generating")
+                return "", pcm, threshold
+
+            worker.join(timeout=30)
+            if worker.is_alive():
+                raise ChatError("Hermes Agent did not finish its reply")
+            if failure:
+                raise failure[0]
+            return result.get("reply", ""), None, threshold
+        finally:
+            self._set_thinking_leds(False)
+            self.source.stop()
+
+    def _status_call(self, method: str, *args: Any, **kwargs: Any) -> None:
+        if self.status is None:
+            return
+        try:
+            getattr(self.status, method)(*args, **kwargs)
+        except Exception as exc:
+            logging.warning("could not publish voice conversation status: %s", exc)
+
+    def _agent_status_label(self) -> str:
+        details = ["Hermes Agent"]
+        if getattr(self.chat, "model", None):
+            details.append(str(self.chat.model))
+        if getattr(self.chat, "reasoning", None):
+            details.append(f"{self.chat.reasoning} reasoning")
+        details.append("safe toolset")
+        return " · ".join(details)
+
+    def _set_thinking_leds(self, active: bool) -> None:
+        action = self.thinking_start if active else self.thinking_stop
+        if action is None:
+            return
+        try:
+            action()
+        except Exception as exc:
+            # LEDs are status-only: a missing/permission-denied USB control
+            # endpoint must never break the spoken conversation.
+            logging.warning(
+                "could not %s ReSpeaker thinking LEDs: %s",
+                "start" if active else "stop",
+                exc,
+            )
 
 
 def build_model(model_path: Path, feature_model_dir: Path) -> Any:
@@ -484,12 +847,22 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="after waking, transcribe speech, ask Hermes, speak replies, and accept follow-ups",
     )
-    parser.add_argument("--speech-threshold", type=float, default=300)
-    parser.add_argument("--speech-silence", type=float, default=1.0)
-    parser.add_argument("--speech-start-timeout", type=float, default=10)
-    parser.add_argument("--followup-timeout", type=float, default=8)
-    parser.add_argument("--max-utterance", type=float, default=20)
-    parser.add_argument("--conversation-max-turns", type=int, default=6)
+    parser.add_argument("--speech-threshold", type=float, default=200)
+    parser.add_argument("--speech-silence", type=float, default=3.0)
+    parser.add_argument("--speech-start-timeout", type=float, default=15)
+    parser.add_argument("--followup-timeout", type=float, default=15)
+    parser.add_argument("--max-utterance", type=float, default=120)
+    parser.add_argument("--conversation-max-turns", type=int, default=30)
+    parser.add_argument("--max-silent-cycles", type=int, default=3)
+    parser.add_argument(
+        "--barge-in",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="listen for echo-cancelled speech while Hermes generates and speaks",
+    )
+    parser.add_argument("--barge-in-threshold-multiplier", type=float, default=3.0)
+    parser.add_argument("--barge-in-min-threshold", type=float, default=500)
+    parser.add_argument("--barge-in-grace", type=float, default=0.5)
     parser.add_argument(
         "--download-features",
         action="store_true",
@@ -517,8 +890,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         conversation = None
         if args.conversation:
             from .chat import HermesChat
+            from .respeaker_leds import spin as start_thinking_leds
+            from .respeaker_leds import turn_off as stop_thinking_leds
+            from .voice_status import VoiceStatusWriter
 
-            chat = HermesChat(session_name="hibot-voice")
+            chat = HermesChat(
+                session_name="hibot-voice",
+                model="gpt-5.6-luna",
+                provider="openai-codex",
+                reasoning="low",
+            )
+            voice_status = VoiceStatusWriter()
+            voice_status.idle()
             conversation = VoiceConversation(
                 source,
                 UtteranceRecorder(
@@ -527,10 +910,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     max_seconds=args.max_utterance,
                 ),
                 chat,
-                HermesReplySpeaker(chat, args.playback_device),
+                HermesReplySpeaker(
+                    chat,
+                    args.playback_device,
+                    barge_in_grace_seconds=args.barge_in_grace,
+                ),
                 initial_timeout=args.speech_start_timeout,
                 followup_timeout=args.followup_timeout,
                 max_turns=args.conversation_max_turns,
+                max_silent_cycles=args.max_silent_cycles,
+                barge_in=args.barge_in,
+                barge_in_min_threshold=args.barge_in_min_threshold,
+                barge_in_threshold_multiplier=args.barge_in_threshold_multiplier,
+                thinking_start=start_thinking_leds,
+                thinking_stop=stop_thinking_leds,
+                status=voice_status,
             )
         listener = WakeWordListener(
             model,

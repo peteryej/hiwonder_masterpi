@@ -22,6 +22,7 @@ from .chat import HermesChat
 from .robot import Robot, RobotError, ValidationError
 from .sound import ReSpeakerDirection, SoundTracker, SoundUnavailable
 from .vision import VisionGrasper, annotate_object_detections
+from .voice_status import read_voice_status
 
 LOG = logging.getLogger(__name__)
 MAX_BODY_BYTES = 16 * 1024
@@ -44,6 +45,7 @@ def make_handler(
     ca_certificate: Optional[bytes] = None,
     vision_grasper: Any = None,
     sound_tracker: Any = None,
+    voice_status_file: Optional[Path] = None,
 ) -> type[BaseHTTPRequestHandler]:
     index = _index_html()
     chat_service = chat or HermesChat()
@@ -298,6 +300,11 @@ def make_handler(
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         {"ok": False, "error": str(exc)},
                     )
+            elif path == "/api/voice/conversation":
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "conversation": read_voice_status(voice_status_file)},
+                )
             elif path == "/api/camera/stream":
                 self._send_camera_stream()
             else:

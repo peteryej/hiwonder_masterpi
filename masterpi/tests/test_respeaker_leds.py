@@ -1,7 +1,7 @@
 import types
 import unittest
 
-from masterpi_control.respeaker_leds import ReSpeakerLedError, turn_off
+from masterpi_control.respeaker_leds import ReSpeakerLedError, spin, turn_off
 
 
 class FakeDevice:
@@ -49,6 +49,29 @@ class ReSpeakerLedTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReSpeakerLedError, "access denied"):
             turn_off(usb_module=self.usb)
+
+    def test_spin_sets_thinking_palette_and_starts_firmware_animation(self):
+        device = FakeDevice()
+
+        spin(device=device, usb_module=self.usb)
+
+        self.assertEqual(
+            device.calls,
+            [
+                (0x40, 0, 0x22, 0x1C, [0], 8000),
+                (0x40, 0, 0x20, 0x1C, [8], 8000),
+                (
+                    0x40,
+                    0,
+                    0x21,
+                    0x1C,
+                    [0, 80, 255, 0, 0, 220, 255, 0],
+                    8000,
+                ),
+                (0x40, 0, 5, 0x1C, [0], 8000),
+            ],
+        )
+        self.assertEqual(self.disposed, [device])
 
 
 if __name__ == "__main__":

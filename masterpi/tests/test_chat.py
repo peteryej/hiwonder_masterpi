@@ -1,9 +1,10 @@
 import json
 import subprocess
+import threading
 import unittest
 from pathlib import Path
 
-from masterpi_control.chat import ChatError, HermesChat
+from masterpi_control.chat import ChatError, ChatInterrupted, HermesChat, NoSpeechDetected
 
 
 class FakeRunner:
@@ -63,6 +64,71 @@ class HermesChatTests(unittest.TestCase):
         self.assertEqual(command[command.index("--toolsets") + 1], "safe")
         self.assertEqual(options["input"], "Hello")
 
+    def test_new_session_uses_unique_name_with_configured_prefix(self):
+        runner = FakeRunner()
+        chat = HermesChat(runner=runner, session_name="hibot-voice")
+
+        first = chat.new_session()
+        second = chat.new_session()
+
+        self.assertTrue(first.startswith("hibot-voice-"))
+        self.assertTrue(second.startswith("hibot-voice-"))
+        self.assertNotEqual(first, second)
+        chat.reply("Hello")
+        self.assertIn(second, runner.calls[0][0])
+
+    def test_voice_model_and_reasoning_can_be_scoped_to_one_chat_client(self):
+        runner = FakeRunner()
+        chat = HermesChat(
+            runner=runner,
+            session_name="hibot-voice",
+            model="gpt-5.6-luna",
+            provider="openai-codex",
+            reasoning="low",
+        )
+
+        chat.reply("Hello")
+
+        command = runner.calls[0][0]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-luna")
+        self.assertEqual(command[command.index("--provider") + 1], "openai-codex")
+        self.assertEqual(command[command.index("--reasoning") + 1], "low")
+
+    def test_interruptible_reply_terminates_hermes_process(self):
+        class Process:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+                self.done = threading.Event()
+
+            def communicate(self, input=None):
+                self.input = input
+                self.done.wait(2)
+                return "", ""
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+                self.done.set()
+
+            def kill(self):
+                self.returncode = -9
+                self.done.set()
+
+        process = Process()
+        chat = HermesChat(
+            runner=FakeRunner(),
+            popen=lambda *_args, **_kwargs: process,
+        )
+        cancel = threading.Event()
+        cancel.set()
+
+        with self.assertRaises(ChatInterrupted):
+            chat.reply_interruptible("new question", cancel)
+
+        self.assertTrue(process.terminated)
+        self.assertEqual(process.input, "new question")
+
     def test_transcribe_passes_recording_to_hermes_stt(self):
         runner = FakeRunner()
         chat = HermesChat(runner=runner)
@@ -79,6 +145,14 @@ class HermesChatTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ChatError, "STT unavailable"):
             HermesChat(runner=failing_runner).transcribe(b"audio", "audio/ogg")
+
+    def test_transcribe_treats_filtered_whisper_hallucination_as_silence(self):
+        def silent_runner(command, **kwargs):
+            result = {"success": True, "transcript": "", "filtered": True}
+            return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
+
+        with self.assertRaises(NoSpeechDetected):
+            HermesChat(runner=silent_runner).transcribe(b"audio", "audio/wav")
 
     def test_synthesize_returns_generated_mp3(self):
         runner = FakeRunner()

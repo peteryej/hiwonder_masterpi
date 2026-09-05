@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -17,6 +19,14 @@ from urllib.request import Request, urlopen
 
 class ChatError(RuntimeError):
     """Raised when chat or speech transcription cannot complete."""
+
+
+class ChatInterrupted(ChatError):
+    """Raised when a live voice interjection cancels an in-flight reply."""
+
+
+class NoSpeechDetected(ChatError):
+    """Raised when Hermes STT identifies silence rather than an utterance."""
 
 
 _MIME_SUFFIXES = {
@@ -40,10 +50,31 @@ class HermesChat:
     def __init__(
         self,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        popen: Callable[..., Any] = subprocess.Popen,
         session_name: str = "hibot-web-safe",
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        reasoning: Optional[str] = None,
     ) -> None:
         self._runner = runner
+        self._popen = popen
+        self._session_prefix = session_name
         self._session_name = session_name
+        self.model = str(model).strip() if model else None
+        self.provider = str(provider).strip() if provider else None
+        self.reasoning = str(reasoning).strip().lower() if reasoning else None
+        if self.reasoning not in {
+            None,
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }:
+            raise ValueError("unsupported Hermes reasoning effort")
         self._lock = threading.Lock()
         self._hermes = os.environ.get("MASTERPI_HERMES_BIN") or shutil.which("hermes")
         self._hermes_root = Path(
@@ -61,9 +92,14 @@ class HermesChat:
             )
         )
 
-    def reply(self, message: str) -> str:
-        if self._api_url:
-            return self._api_reply(message)
+    def new_session(self) -> str:
+        """Select a unique named Hermes session for a new voice conversation."""
+
+        with self._lock:
+            self._session_name = f"{self._session_prefix}-{uuid.uuid4().hex}"
+            return self._session_name
+
+    def _reply_command(self) -> list[str]:
         if not self._hermes:
             raise ChatError("Hermes Agent executable was not found")
         command = [
@@ -86,6 +122,28 @@ class HermesChat:
             "--run-budget",
             "120",
         ]
+        if self.model:
+            command.extend(["--model", self.model])
+        if self.provider:
+            command.extend(["--provider", self.provider])
+        if self.reasoning:
+            command.extend(["--reasoning", self.reasoning])
+        return command
+
+    @staticmethod
+    def _reply_text(stdout: str) -> str:
+        lines = stdout.strip().splitlines()
+        if lines and lines[0].startswith("session_id:"):
+            lines.pop(0)
+        reply = "\n".join(lines).strip()
+        if not reply:
+            raise ChatError("Hermes Agent returned an empty reply")
+        return reply
+
+    def reply(self, message: str) -> str:
+        if self._api_url:
+            return self._api_reply(message)
+        command = self._reply_command()
         with self._lock:
             completed = self._runner(
                 command,
@@ -97,13 +155,76 @@ class HermesChat:
         if completed.returncode:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise ChatError(detail or "Hermes Agent did not return a reply")
-        lines = completed.stdout.strip().splitlines()
-        if lines and lines[0].startswith("session_id:"):
-            lines.pop(0)
-        reply = "\n".join(lines).strip()
-        if not reply:
-            raise ChatError("Hermes Agent returned an empty reply")
-        return reply
+        return self._reply_text(completed.stdout)
+
+    def reply_interruptible(self, message: str, cancel: threading.Event) -> str:
+        """Run a Hermes turn that can be cancelled when the user speaks."""
+
+        if self._api_url:
+            return self._api_reply(message)
+        command = self._reply_command()
+        with self._lock:
+            try:
+                process = self._popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise ChatError(f"could not start Hermes Agent: {exc}") from exc
+
+            result: dict[str, str] = {}
+            failure: list[BaseException] = []
+
+            def communicate() -> None:
+                try:
+                    stdout, stderr = process.communicate(input=message)
+                    result.update(stdout=stdout or "", stderr=stderr or "")
+                except BaseException as exc:  # surfaced in the caller thread
+                    failure.append(exc)
+
+            worker = threading.Thread(target=communicate, daemon=True)
+            worker.start()
+            while worker.is_alive() and not cancel.wait(0.05):
+                pass
+            if cancel.is_set():
+                if worker.is_alive():
+                    self._terminate_process(process)
+                    worker.join(timeout=5)
+                    if worker.is_alive():
+                        self._kill_process(process)
+                        worker.join(timeout=2)
+                raise ChatInterrupted("Hermes reply was interrupted by speech")
+            worker.join()
+            if failure:
+                raise ChatError(f"Hermes Agent communication failed: {failure[0]}")
+            if process.returncode:
+                detail = result.get("stderr", "").strip() or result.get("stdout", "").strip()
+                raise ChatError(detail or "Hermes Agent did not return a reply")
+            return self._reply_text(result.get("stdout", ""))
+
+    @staticmethod
+    def _terminate_process(process: Any) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (AttributeError, OSError, ProcessLookupError):
+            try:
+                process.terminate()
+            except (AttributeError, OSError, ProcessLookupError):
+                pass
+
+    @staticmethod
+    def _kill_process(process: Any) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except (AttributeError, OSError, ProcessLookupError):
+                pass
 
     def analyze_image(self, jpeg: bytes) -> dict[str, Any]:
         """Analyze one camera JPEG with Hermes' configured vision model."""
@@ -270,8 +391,8 @@ class HermesChat:
 
         script = (
             "import json,sys; "
-            "from tools.transcription_tools import transcribe_audio; "
-            "print(json.dumps(transcribe_audio(sys.argv[1], source='masterpi-web')))"
+            "from tools.voice_mode import transcribe_recording; "
+            "print(json.dumps(transcribe_recording(sys.argv[1])))"
         )
         path = ""
         try:
@@ -297,7 +418,7 @@ class HermesChat:
             raise ChatError(str(result.get("error") or "Audio transcription failed"))
         transcript = str(result.get("transcript") or "").strip()
         if not transcript:
-            raise ChatError("No speech was detected in the recording")
+            raise NoSpeechDetected("No speech was detected in the recording")
         return transcript
 
     def synthesize(self, text: str) -> tuple[bytes, str]:

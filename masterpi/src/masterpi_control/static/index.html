@@ -39,6 +39,14 @@
     .chat-message { width: fit-content; max-width: 85%; margin: 0; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     .chat-message.user { justify-self: end; background: #294fae; }
     .chat-message.hibot { justify-self: start; background: #263748; }
+    .chat-message.step { justify-self: stretch; width: auto; max-width: 100%; padding: 7px 10px; border-left: 3px solid #668cff; border-radius: 6px; background: #192331; color: #afbdd0; font-size: .8rem; }
+    .chat-message.error { justify-self: stretch; width: auto; max-width: 100%; background: #351e24; color: #ff9daa; font-size: .84rem; }
+    .chat-message.thinking { display: flex; align-items: center; gap: 7px; color: #c7d3e3; }
+    .thinking-dots { display: inline-flex; gap: 3px; }
+    .thinking-dots i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: thinking-pulse 1.1s infinite ease-in-out; }
+    .thinking-dots i:nth-child(2) { animation-delay: .16s; }
+    .thinking-dots i:nth-child(3) { animation-delay: .32s; }
+    @keyframes thinking-pulse { 0%, 60%, 100% { opacity: .25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
     .chat-vision-image { display: block; max-width: min(100%, 640px); height: auto; justify-self: start; border: 1px solid #445268; border-radius: 10px; }
     .chat-compose { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; margin-top: 12px; }
     .chat-compose input { min-width: 0; border: 1px solid #455268; border-radius: 8px; padding: 10px; background: #0f1722; color: #fff; }
@@ -252,6 +260,10 @@
   let replyAudioUrl = null;
   let replyAudioContext = null;
   let replyAudioSource = null;
+  let webChatBusy = false;
+  let voiceSession = null;
+  const voiceEventsSeen = new Set();
+  let thinkingMessage = null;
 
   secureAudioLink.href = `https://${location.hostname}:8443/`;
   secureAudioHelp.hidden = window.isSecureContext;
@@ -284,6 +296,51 @@
     message.textContent = text;
     chatMessages.append(message);
     chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+  function setThinkingIndicator(active) {
+    if (!active) {
+      thinkingMessage?.remove();
+      thinkingMessage = null;
+      return;
+    }
+    if (thinkingMessage) return;
+    thinkingMessage = document.createElement('p');
+    thinkingMessage.className = 'chat-message hibot thinking';
+    thinkingMessage.setAttribute('role', 'status');
+    thinkingMessage.innerHTML = '<span>hibot is thinking</span><span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span>';
+    chatMessages.append(thinkingMessage);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+  function addVoiceEvent(event) {
+    const kind = ['user', 'hibot', 'error'].includes(event.role) ? event.role : 'step';
+    const detail = event.tool ? `${event.text}\nTool: ${event.tool}` : event.text;
+    addChatMessage(kind, detail);
+  }
+  async function updateVoiceConversation() {
+    try {
+      const response = await fetch('/api/voice/conversation', {cache:'no-store'});
+      const body = await response.json();
+      if (!response.ok || !body.ok) throw new Error(body.error || 'Voice status unavailable');
+      const voice = body.conversation;
+      if (voice.session && voice.session !== voiceSession) {
+        voiceSession = voice.session;
+      }
+      if (!webChatBusy) setThinkingIndicator(false);
+      for (const event of voice.events || []) {
+        const eventKey = `${voice.session || 'none'}:${event.id}`;
+        if (voiceEventsSeen.has(eventKey)) continue;
+        voiceEventsSeen.add(eventKey);
+        addVoiceEvent(event);
+      }
+      if (!webChatBusy) {
+        setThinkingIndicator(voice.active && voice.state === 'thinking');
+        chatState.textContent = voice.status || 'Ready';
+      }
+    } catch (error) {
+      if (!webChatBusy) chatState.textContent = 'Voice status unavailable';
+    } finally {
+      window.setTimeout(updateVoiceConversation, 700);
+    }
   }
   function addChatImage(src, alt='Detected objects with bounding boxes') {
     const image = document.createElement('img');
@@ -337,21 +394,29 @@
     if (speakReplies.checked) primeReplyAudio().catch(() => {});
     addChatMessage('user', message);
     chatInput.value = '';
+    webChatBusy = true;
+    setThinkingIndicator(true);
     chatState.textContent = 'hibot is thinking…';
     try {
       await receiveChat(await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message})}));
       chatState.textContent = 'Ready';
     } catch (error) {
       chatState.textContent = error.message;
+    } finally {
+      webChatBusy = false;
+      setThinkingIndicator(false);
     }
   }
   async function sendAudio(blob) {
+    webChatBusy = true;
     chatState.textContent = 'Transcribing audio…';
     try {
       await receiveChat(await fetch('/api/chat/audio', {method:'POST', headers:{'Content-Type':blob.type || 'audio/webm'}, body:blob}));
       chatState.textContent = 'Ready';
     } catch (error) {
       chatState.textContent = error.message;
+    } finally {
+      webChatBusy = false;
     }
   }
   document.querySelector('#sendChat').onclick = sendChatMessage;
@@ -390,6 +455,7 @@
       secureAudioHelp.hidden = false;
     }
   };
+  updateVoiceConversation();
 
   function showCamera() {
     cameraVisible = true;
