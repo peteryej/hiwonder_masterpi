@@ -66,12 +66,12 @@ class RobotTests(unittest.TestCase):
         self.assertEqual(result["duration"], 0.8)
         self.assertEqual(
             [(item["servo_id"], item["pulse"]) for item in result["servos"]],
-            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
         )
         servo_events = [event for event in self.backend.events if event["action"] == "servo"]
         self.assertEqual(
             [(event["servo_id"], event["pulse"], event["duration"]) for event in servo_events],
-            [(3, 500, 0.8), (4, 2500, 0.8), (5, 1350, 0.8), (6, 1500, 0.8)],
+            [(3, 500, 0.8), (4, 2500, 0.8), (5, 810, 0.8), (6, 1500, 0.8)],
         )
 
     def test_nod_starts_and_ends_at_home_with_safe_servo3_motion(self):
@@ -210,6 +210,13 @@ class RobotTests(unittest.TestCase):
         self.assertTrue(motion_events)
         self.assertTrue(all(event["speed"] == 0.0 for event in motion_events))
         self.assertTrue(all(event["direction"] == 90.0 for event in motion_events))
+
+    def test_180_degree_bearing_rotation_uses_one_second_calibration(self):
+        self.robot.backend.mock_distance_mm = 200
+        with patch.object(self.robot, "_run_drive_for") as drive_for:
+            result = self.robot.approach_bearing(180, approach_duration=0.1, clearance_cm=25)
+        self.assertEqual(result["turn_duration"], 1.0)
+        drive_for.assert_called_once_with(0.0, 90.0, 0.6, 1.0)
 
     def test_reactive_navigation_stops_and_turns_for_obstacle(self):
         self.robot.backend.mock_distance_mm = 200

@@ -24,7 +24,7 @@ from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHand
 
 
 SCORE = Path(__file__).with_name("dance_score.json")
-VIDEO = Path(__file__).with_name("dance_move.mp4")
+VIDEO = Path(__file__).with_name("dance_move_1.mp4")
 DEFAULT_AUDIO_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"
 HEARTBEAT = 0.15  # Existing controller watchdog: 0.6 seconds.
 MAX_LATENESS = 0.35
@@ -38,11 +38,15 @@ class AudioPlayer:
     """Decode the MP4 audio track into the ReSpeaker ALSA output."""
 
     def __init__(self, path, device=DEFAULT_AUDIO_DEVICE, tempo=1.0,
-                 popen=subprocess.Popen):
+                 popen=subprocess.Popen, runner=subprocess.run,
+                 clock=time.monotonic, sleeper=time.sleep):
         self.path = Path(path)
         self.device = device
         self.tempo = number(tempo, 0.25, 1, "tempo")
         self._popen = popen
+        self._runner = runner
+        self._clock = clock
+        self._sleep = sleeper
         self.decoder = None
         self.player = None
         if not self.path.is_file():
@@ -60,6 +64,38 @@ class AudioPlayer:
             remaining /= 0.5
         factors.append(remaining)
         return ",".join(f"atempo={factor:g}" for factor in factors)
+
+    def wait_until_available(self, timeout=30.0, settle=0.75):
+        """Wait until ALSA can be opened twice, avoiding active voice replies."""
+        deadline = self._clock() + timeout
+        detail = "ALSA playback device is busy"
+        consecutive = 0
+        while self._clock() < deadline:
+            try:
+                completed = self._runner(
+                    [
+                        "aplay", "-q", "-D", self.device, "-t", "raw",
+                        "-f", "S16_LE", "-c", "2", "-r", "48000", "/dev/null",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                detail = str(exc)
+                consecutive = 0
+            else:
+                if completed.returncode == 0:
+                    consecutive += 1
+                    if consecutive == 2:
+                        return
+                else:
+                    detail = completed.stderr.strip() or completed.stdout.strip() or detail
+                    consecutive = 0
+            remaining = deadline - self._clock()
+            if remaining > 0:
+                self._sleep(min(settle, remaining))
+        raise DanceError(f"Audio output did not become available: {detail}")
 
     def start(self):
         if self.decoder is not None or self.player is not None:
@@ -230,7 +266,8 @@ class Controller:
             raise DanceError(f"{action} rejected: {result}")
 
 
-def play(events, post, clock=time.monotonic, sleep=time.sleep, log=print, audio=None):
+def play(events, post, clock=time.monotonic, sleep=time.sleep, log=print, audio=None,
+         wait_for_audio=False):
     """Absolute deadlines; abort stalled playback instead of rushing old cues.
 
     No retry of motion commands: an HTTP failure may follow partial execution.
@@ -245,6 +282,9 @@ def play(events, post, clock=time.monotonic, sleep=time.sleep, log=print, audio=
         for count in (3, 2, 1):
             log(f"Starting in {count}…")
             sleep(1)
+        if audio is not None and wait_for_audio:
+            log("Waiting for the voice speaker to become available…")
+            audio.wait_until_available()
         log("GO — video/audio time 0.00")
         if audio is not None:
             audio.start()
@@ -280,7 +320,7 @@ def play(events, post, clock=time.monotonic, sleep=time.sleep, log=print, audio=
             else:
                 sleep(max(0, min(deadline, refresh_at) - now))
         if audio is not None:
-            # The MP4 is 0.01 seconds longer than the rounded score. Let its
+            # The MP4 is about 0.02 seconds longer than the rounded score. Let its
             # final samples drain instead of clipping them at the last cue.
             audio.wait(timeout=1.0)
     finally:
@@ -309,6 +349,8 @@ def main(argv=None):
     parser.add_argument("--no-audio", action="store_true", help="execute without the MP4 audio track")
     parser.add_argument("--audio-device", default=DEFAULT_AUDIO_DEVICE,
                         help="ALSA playback device (default: ReSpeaker output)")
+    parser.add_argument("--wait-for-audio", action="store_true",
+                        help="wait for voice playback to release ALSA before GO")
     args = parser.parse_args(argv)
     if args.execute and not args.url:
         parser.error("--execute requires --url")
@@ -332,7 +374,8 @@ def main(argv=None):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, interrupt)
         try:
-            play(events, controller.post, audio=audio)
+            play(events, controller.post, audio=audio,
+                 wait_for_audio=args.wait_for_audio)
         finally:
             signal.signal(signal.SIGTERM, previous)
         return 0

@@ -1,5 +1,42 @@
 # MasterPi progress
 
+2026-09-09
+
+## Extended dance soundtrack and choreography
+
+- Updated `robot_choregraph/dance.py` to play `dance_move_1.mp4`, whose AAC
+  soundtrack and video run for 30.016 seconds.
+- Extended the synchronized score through the new ten-second ending and kept
+  the existing ReSpeaker availability wait for MCP/voice-triggered dances.
+- Updated the web quick action and MCP metadata to use the 34.6-second total
+  runtime (30-second score plus Home setup and countdown).
+- Removed the superseded `dance_1.py` and 20-second `dance_move.mp4` files;
+  `dance.py` and `dance_move_1.mp4` are now the canonical pair.
+- Verification passes all 138 MasterPi tests and 17 executable dance tests;
+  the optional vendor-SDK path check is skipped. The user-level controller was
+  restarted and its web/state endpoints returned HTTP 200. No dance, physical
+  motion, or speaker playback was invoked during verification.
+
+2026-09-07
+
+## Web dance quick action
+
+- Added a **Dance** button to the web controller's Quick arm controls.
+- Added `POST /api/dance`, which asynchronously launches
+  `robot_choregraph/dance.py --execute` against the local controller. The dance
+  includes synchronized MP4 audio and overlapping launches are rejected.
+- Registered the same action as the `dance` MCP and OpenAI Realtime tool through
+  the shared robot-action schema and loopback-only `POST /api/agent/dance`.
+- Fixed ReSpeaker contention specific to MCP/voice dance requests. The agent
+  route launches `dance.py --wait-for-audio`, which waits for two consecutive
+  successful ALSA probes before setting choreography time zero; the webpage
+  button keeps its immediate startup behavior.
+- The web server owns the dance child process and terminates it during
+  controller shutdown; the choreography retains its chassis and audio cleanup.
+- Verification passes all 130 MasterPi tests. The restarted MCP server
+  advertises 18 tools including `dance`; the controller, wake-word listener,
+  and Hermes gateway were restarted successfully without invoking the dance.
+
 2026-09-04
 
 ## Done

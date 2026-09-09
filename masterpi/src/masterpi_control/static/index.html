@@ -165,10 +165,12 @@
             <button id="quickHome" class="secondary">Home</button>
             <button id="quickCheckFront" class="secondary">Check front</button>
             <button id="quickGrab">Grab object</button>
+            <button id="quickGrabCan">Grab can</button>
             <button id="quickOpen" class="secondary">Open gripper</button>
             <button id="quickClose" class="secondary">Close gripper</button>
             <button id="quickNod" class="secondary">Nod</button>
             <button id="quickShake" class="secondary">Shake</button>
+            <button id="quickDance">Dance</button>
           </div>
         </div>
       </div>
@@ -615,12 +617,41 @@
       quickGrab.disabled = false;
     }
   };
+  const quickGrabCan = document.querySelector('#quickGrabCan');
+  quickGrabCan.onclick = async () => {
+    quickGrabCan.disabled = true;
+    setArmStatus('Running the recorded can-grab action…');
+    try {
+      await api('grab', {force:true, pickup:'can'});
+      setArmStatus('Can-grab action completed and arm returned Home.');
+    } catch (error) {
+      setArmStatus(error.message, true);
+    } finally {
+      quickGrabCan.disabled = false;
+    }
+  };
   document.querySelector('#open').onclick = () => api('gripper', {opened:true});
   document.querySelector('#close').onclick = () => api('gripper', {opened:false});
   document.querySelector('#quickOpen').onclick = () => api('gripper', {opened:true});
   document.querySelector('#quickClose').onclick = () => api('gripper', {opened:false});
   document.querySelector('#quickNod').onclick = () => sendArmCommand('gesture/nod', {}, 'Nod completed.');
   document.querySelector('#quickShake').onclick = () => sendArmCommand('gesture/shake', {}, 'Shake completed.');
+  const quickDance = document.querySelector('#quickDance');
+  quickDance.onclick = async () => {
+    quickDance.disabled = true;
+    setArmStatus('Starting dance with synchronized audio…');
+    try {
+      const result = await api('dance');
+      setArmStatus('Dance started. Keep the area around the robot clear.');
+      setTimeout(() => {
+        quickDance.disabled = false;
+        if (armStatus.textContent.startsWith('Dance started')) setArmStatus('Dance completed.');
+      }, Math.ceil((result.duration_seconds || 35) * 1000));
+    } catch (error) {
+      quickDance.disabled = false;
+      setArmStatus(error.message, true);
+    }
+  };
   document.querySelectorAll('.servo-slider').forEach(slider => {
     const output = document.querySelector(`output[for="${slider.id}"]`);
     slider.addEventListener('input', () => { output.value = slider.value; output.textContent = slider.value; });

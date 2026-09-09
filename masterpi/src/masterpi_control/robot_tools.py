@@ -73,6 +73,12 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
         _object_schema(),
     ),
     RobotToolDefinition(
+        "dance",
+        "Start HiBot's bundled 30-second choreography with synchronized music. The action returns immediately after the dance process starts.",
+        "dance",
+        _object_schema(),
+    ),
+    RobotToolDefinition(
         "home_arm",
         "Move HiBot's arm to its documented Home pose.",
         "home",

@@ -5,6 +5,14 @@ from masterpi_control import hibot_mcp
 
 
 class HibotMcpTests(unittest.TestCase):
+    def test_dance_uses_shared_async_action(self):
+        expected = {"started": True, "audio": True}
+        with patch.object(hibot_mcp.client, "call", return_value=expected) as call:
+            result = hibot_mcp.dance()
+
+        self.assertEqual(result, expected)
+        call.assert_called_once_with("dance")
+
     def test_check_front_uses_shared_exact_pose_action(self):
         expected = {"pose": "check_front"}
         with patch.object(hibot_mcp.client, "call", return_value=expected) as call:

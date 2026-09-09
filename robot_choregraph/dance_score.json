@@ -1,6 +1,6 @@
 {
-  "source": "dance_move.mp4; manually sampled at 0.25-second intervals",
-  "duration": 20.0,
+  "source": "dance_move_1.mp4; manually sampled at 0.25-second intervals",
+  "duration": 30.0,
   "poses": {
     "home": [0, 6, 18, 0],
     "wave_right": [5, 8, 19, 0],
@@ -53,6 +53,24 @@
     {"at": 19.0, "label": "Final claw pulse", "gripper": false},
     {"at": 19.25, "label": "Open claw for finish", "gripper": true},
     {"at": 19.5, "label": "Raised diagonal finish with small turn", "arm": "salute_left", "move": 0.45, "drive": [0, 90, -0.5]},
-    {"at": 20.0, "label": "End: stop wheels, hold final arm pose", "drive": [0, 0, 0]}
+    {"at": 20.0, "label": "New ending: stop and hold the diagonal pose", "drive": [0, 0, 0]},
+    {"at": 20.25, "label": "Sweep raised claw toward screen right", "arm": "wave_right", "move": 0.4},
+    {"at": 20.75, "label": "Sweep raised claw across to screen left", "arm": "wave_left", "move": 0.4},
+    {"at": 21.25, "label": "Lift into a high salute", "arm": "salute", "move": 0.4},
+    {"at": 21.75, "label": "Gather arm at center", "arm": "home", "move": 0.4},
+    {"at": 22.25, "label": "Turn left with a forward reach", "arm": "reach", "move": 0.4, "drive": [0, 90, -0.75]},
+    {"at": 23.0, "label": "Reverse turn with a diagonal reach", "arm": "reach_right", "move": 0.4, "drive": [0, 90, 0.75]},
+    {"at": 23.75, "label": "Stop side-on and bow low", "arm": "low_front", "move": 0.45, "drive": [0, 0, 0]},
+    {"at": 24.25, "label": "Sweep the low bow to the side", "arm": "low_right", "move": 0.45},
+    {"at": 24.75, "label": "Rise into the next left turn", "arm": "reach", "move": 0.4, "drive": [0, 90, -0.75]},
+    {"at": 25.5, "label": "Reverse turn and raise the claw", "arm": "wave_right", "move": 0.4, "drive": [0, 90, 0.75]},
+    {"at": 26.25, "label": "Counter-turn with opposite wave", "arm": "wave_left", "move": 0.4, "drive": [0, 90, -0.75]},
+    {"at": 27.0, "label": "Stop and dip for the final rise", "arm": "low_front", "move": 0.4, "drive": [0, 0, 0]},
+    {"at": 27.5, "label": "Return through center", "arm": "home", "move": 0.4},
+    {"at": 28.0, "label": "High open-claw finale", "arm": "salute", "move": 0.45, "gripper": true},
+    {"at": 28.75, "label": "Diagonal finish with small turn", "arm": "salute_left", "move": 0.45, "drive": [0, 90, -0.5]},
+    {"at": 29.25, "label": "Final claw close", "gripper": false},
+    {"at": 29.5, "label": "Open claw for the last beat", "gripper": true},
+    {"at": 30.0, "label": "End: stop wheels, hold final arm pose", "drive": [0, 0, 0]}
   ]
 }

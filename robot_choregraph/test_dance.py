@@ -47,6 +47,9 @@ class FakeAudio:
     def start(self):
         self.calls.append((self.playback.now, "start"))
 
+    def wait_until_available(self):
+        self.calls.append((self.playback.now, "available"))
+
     def wait(self, timeout):
         self.calls.append((self.playback.now, "wait", timeout))
 
@@ -64,7 +67,7 @@ class DanceTests(unittest.TestCase):
                 patch.object(dance, "AudioPlayer", side_effect=AssertionError("audio")):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(dance.main([]), 0)
-        self.assertIn("20.00s", output.getvalue())
+        self.assertIn("30.00s", output.getvalue())
 
     def test_audio_starts_at_go_and_drains_after_final_cue(self):
         fake = FakePlayback()
@@ -72,8 +75,18 @@ class DanceTests(unittest.TestCase):
         dance.play(self.events, fake.post, fake.clock, fake.sleep, lambda _: None, audio)
         self.assertEqual(audio.calls, [
             (4.5, "start"),
-            (24.5, "wait", 1.0),
-            (24.5, "stop"),
+            (34.5, "wait", 1.0),
+            (34.5, "stop"),
+        ])
+
+    def test_agent_mode_waits_for_audio_before_go(self):
+        fake = FakePlayback()
+        audio = FakeAudio(fake)
+        dance.play(self.events, fake.post, fake.clock, fake.sleep, lambda _: None,
+                   audio, wait_for_audio=True)
+        self.assertEqual(audio.calls[:2], [
+            (4.5, "available"),
+            (4.5, "start"),
         ])
 
     def test_audio_stops_if_motion_fails(self):
@@ -117,6 +130,22 @@ class DanceTests(unittest.TestCase):
                                       popen=unittest.mock.MagicMock())
         self.assertEqual(audio.tempo_filter(), "atempo=0.5,atempo=0.5")
 
+    def test_audio_availability_waits_for_two_successful_probes(self):
+        fake = FakePlayback()
+        busy = SimpleNamespace(returncode=1, stderr="Device or resource busy", stdout="")
+        ready = SimpleNamespace(returncode=0, stderr="", stdout="")
+        runner = unittest.mock.MagicMock(side_effect=[busy, ready, ready])
+        with patch.object(dance.shutil, "which", return_value="/usr/bin/tool"):
+            audio = dance.AudioPlayer(
+                dance.VIDEO,
+                runner=runner,
+                clock=fake.clock,
+                sleeper=fake.sleep,
+            )
+        audio.wait_until_available(timeout=5, settle=0.25)
+        self.assertEqual(runner.call_count, 3)
+        self.assertEqual(fake.now, 0.5)
+
     def test_execute_requires_explicit_address(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             dance.main(["--execute"])
@@ -131,8 +160,8 @@ class DanceTests(unittest.TestCase):
                 self.assertEqual(final_stop[1], "stop")
                 # One in-flight heartbeat may finish just after a cue deadline;
                 # request latency must not accumulate across the whole score.
-                self.assertGreaterEqual(final_stop[0] - origin, 20 - 1e-9)
-                self.assertLessEqual(final_stop[0] - origin, 20 + latency + 1e-9)
+                self.assertGreaterEqual(final_stop[0] - origin, 30 - 1e-9)
+                self.assertLessEqual(final_stop[0] - origin, 30 + latency + 1e-9)
                 last_drive = None
                 for at, action, body in fake.calls:
                     if action in ("drive", "stop"):
@@ -148,7 +177,7 @@ class DanceTests(unittest.TestCase):
 
     def test_slow_tempo_preserves_nominal_displacement(self):
         slow = dance.compile_score(self.score, tempo=0.5)
-        self.assertEqual(slow[-1][0], 40)
+        self.assertEqual(slow[-1][0], 60)
         for normal, slowed in zip(self.events, slow):
             self.assertEqual(slowed[0], 2 * normal[0])
             for (action, body), (_, other) in zip(normal[2], slowed[2]):
@@ -196,7 +225,7 @@ class DanceTests(unittest.TestCase):
         def failing_stop(action, body):
             nonlocal end_stops
             fake.post(action, body)
-            if fake.now >= 24.5 and action == "stop":
+            if fake.now >= 34.5 and action == "stop":
                 end_stops += 1
                 if end_stops == 2:
                     raise dance.DanceError("stop unavailable")

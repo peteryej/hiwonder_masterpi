@@ -119,6 +119,25 @@ class VisionTests(unittest.TestCase):
             [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 2), (0, 6, 18)],
         )
 
+    def test_centered_can_uses_recorded_direct_servo_pickup_pose(self):
+        robot = Robot(MockBackend())
+        self.addCleanup(robot.close)
+        yellow = colored_jpeg(color=(0, 255, 255))
+        grasper = VisionGrasper(robot, FakeCamera([yellow] * 3))
+        with patch("masterpi_control.vision.time.sleep"):
+            result = grasper.recognize_and_grab("yellow", pickup="can")
+        self.assertTrue(result["grabbed"])
+        servo_events = [event for event in robot.backend.events if event["action"] == "servo"]
+        self.assertEqual(
+            [(event["servo_id"], event["pulse"]) for event in servo_events],
+            [(1, 2000), (3, 1550), (4, 1620), (5, 2500), (6, 1500), (1, 1500)],
+        )
+        arm_events = [event for event in robot.backend.events if event["action"] == "arm"]
+        self.assertEqual(
+            [(event["x"], event["y"], event["z"]) for event in arm_events],
+            [(0, 6, 18), (0, 6, 18)],
+        )
+
     def test_off_center_object_does_not_move_arm(self):
         robot = Robot(MockBackend())
         self.addCleanup(robot.close)
@@ -127,6 +146,19 @@ class VisionTests(unittest.TestCase):
         self.assertFalse(result["grabbed"])
         self.assertIn("not centered", result["reason"])
         self.assertFalse(any(event["action"] == "arm" for event in robot.backend.events))
+
+    def test_one_segmentation_outlier_does_not_mark_stationary_object_unstable(self):
+        robot = Robot(MockBackend())
+        self.addCleanup(robot.close)
+        frames = [
+            colored_jpeg(center=(320, 240)),
+            colored_jpeg(center=(324, 242)),
+            colored_jpeg(center=(500, 350)),
+        ]
+        result = VisionGrasper(robot, FakeCamera(frames)).recognize("red", samples=3)
+        self.assertTrue(result["recognized"])
+        self.assertEqual(result["matches"], 2)
+        self.assertLess(result["center_x"], 0.55)
 
     def test_moving_object_does_not_move_arm(self):
         robot = Robot(MockBackend())

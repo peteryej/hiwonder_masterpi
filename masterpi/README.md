@@ -95,8 +95,13 @@ fixed front pickup coordinate and returns the arm to Home while holding the
 object. It intentionally performs no camera, color, stability, or centering
 check; place the object directly in front of the gripper before selecting it.
 
+The **Grab can** quick-arm action runs the operator-recorded can pickup profile
+without camera or color checks. It opens the gripper, moves servos 3–6 to
+`1550`, `1620`, `2500`, and `1500`, closes servo 1 at `1500`, then returns Home.
+Stage the can at the calibrated pickup point and keep hands clear.
+
 The **Check front** quick-arm preset moves servo 3 to `500`, servo 4 to `2500`,
-servo 5 to `1350`, and servo 6 to `1500` over 0.8 seconds. It leaves the
+servo 5 to `810`, and servo 6 to `1500` over 0.8 seconds. It leaves the
 gripper on servo 1 unchanged.
 
 The chat panel requires the `hermes` command and a configured Hermes model.
@@ -253,7 +258,8 @@ and does not claim success until the controller result is returned.
 
 Voice actions include state, stop, chassis movement, obstacle avoidance, Home,
 Check front, individual confirmed servos, gripper, unconditional front Grab,
-camera analysis, sound direction/approach, LEDs, and buzzer. Each tool start,
+the bundled Dance with synchronized music, camera analysis, sound
+direction/approach, LEDs, and buzzer. Each tool start,
 completion/failure, and elapsed time appears as an intermediate step in the
 webpage conversation feed. The direct Grab action has no color-detection
 guardrail; camera analysis is a separate action.

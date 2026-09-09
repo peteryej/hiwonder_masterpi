@@ -251,7 +251,9 @@ class Robot:
         with self._drive_lock:
             try:
                 if abs(angle) > 10:
-                    turn_duration = min(math.radians(abs(angle)) / turn_rate, 3.0)
+                    # Physical calibration: a 180-degree chassis turn takes
+                    # one second at the webpage's validated yaw rate.
+                    turn_duration = abs(angle) / 180.0
                     self._run_drive_for(
                         0.0,
                         90.0,
@@ -323,7 +325,7 @@ class Robot:
     def check_front(self, duration: Any = 0.8) -> Dict[str, Any]:
         """Move the arm servos to the user-defined forward-looking pose."""
         duration_value = _number("duration", duration, 0.02, 30)
-        targets = ((3, 500), (4, 2500), (5, 1350), (6, 1500))
+        targets = ((3, 500), (4, 2500), (5, 810), (6, 1500))
         with self._gesture_lock:
             commands = [
                 self.servo(servo_id, pulse, duration_value)

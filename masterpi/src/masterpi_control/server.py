@@ -7,6 +7,8 @@ import json
 import logging
 import re
 import ssl
+import subprocess
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -29,6 +31,82 @@ MAX_BODY_BYTES = 16 * 1024
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 
+class DanceUnavailable(RuntimeError):
+    """Raised when the bundled choreography cannot be launched."""
+
+
+class DanceBusy(DanceUnavailable):
+    """Raised when a dance process is already active."""
+
+
+def _default_dance_script() -> Path:
+    return Path(__file__).resolve().parents[3] / "robot_choregraph" / "dance.py"
+
+
+class DanceLauncher:
+    """Own at most one asynchronous dance.py process."""
+
+    def __init__(
+        self,
+        script: Optional[Path] = None,
+        *,
+        python: str = sys.executable,
+        popen: Callable[..., Any] = subprocess.Popen,
+    ) -> None:
+        self.script = Path(script) if script is not None else _default_dance_script()
+        self.python = python
+        self._popen = popen
+        self._lock = threading.Lock()
+        self._process: Any = None
+
+    def start(self, controller_url: str, *, wait_for_audio: bool = False) -> Dict[str, Any]:
+        with self._lock:
+            if self._process is not None and self._process.poll() is None:
+                raise DanceBusy("A dance is already running")
+            if not self.script.is_file():
+                raise DanceUnavailable(f"Dance script was not found: {self.script}")
+            command = [
+                self.python,
+                str(self.script),
+                "--execute",
+                "--url",
+                controller_url,
+            ]
+            if wait_for_audio:
+                command.append("--wait-for-audio")
+            try:
+                process = self._popen(command, cwd=str(self.script.parent))
+            except OSError as exc:
+                raise DanceUnavailable(f"Could not start dance: {exc}") from exc
+            self._process = process
+            threading.Thread(
+                target=self._watch,
+                args=(process,),
+                name="masterpi-dance",
+                daemon=True,
+            ).start()
+            return {
+                "started": True,
+                "pid": process.pid,
+                "audio": True,
+                "wait_for_audio": wait_for_audio,
+                "duration_seconds": 34.6,
+            }
+
+    def _watch(self, process: Any) -> None:
+        status = process.wait()
+        LOG.info("Dance process %s exited with status %s", process.pid, status)
+        with self._lock:
+            if self._process is process:
+                self._process = None
+
+    def stop(self) -> None:
+        with self._lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+
 def _index_html() -> bytes:
     return (
         resources.files("masterpi_control")
@@ -46,6 +124,8 @@ def make_handler(
     vision_grasper: Any = None,
     sound_tracker: Any = None,
     voice_status_file: Optional[Path] = None,
+    dance_launcher: Any = None,
+    dance_controller_url: str = "http://127.0.0.1:8000",
 ) -> type[BaseHTTPRequestHandler]:
     index = _index_html()
     chat_service = chat or HermesChat()
@@ -55,6 +135,7 @@ def make_handler(
         else (VisionGrasper(robot, camera) if camera is not None else None)
     )
     tracker = sound_tracker or SoundTracker(robot)
+    dancer = dance_launcher or DanceLauncher()
 
     def recognize_and_grab(data: Dict[str, Any]) -> Dict[str, Any]:
         if grasper is None:
@@ -63,8 +144,10 @@ def make_handler(
         if not isinstance(force, bool):
             raise ValidationError("force must be true or false")
         if force:
-            return grasper.grab_front()
-        return grasper.recognize_and_grab(data.get("target", "any"))
+            return grasper.grab_front(data.get("pickup", "default"))
+        return grasper.recognize_and_grab(
+            data.get("target", "any"), data.get("pickup", "default")
+        )
 
     def agent_grab(data: Dict[str, Any]) -> Dict[str, Any]:
         if grasper is None:
@@ -368,6 +451,7 @@ def make_handler(
                         d.get("opened"), d.get("duration", 0.5)
                     ),
                     "/api/grab": recognize_and_grab,
+                    "/api/dance": lambda d: dancer.start(dance_controller_url),
                     "/api/camera/analyze": analyze_hermes_camera,
                     "/api/camera/analyze/color": analyze_color_camera,
                     "/api/rgb": lambda d: robot.rgb(d.get("red"), d.get("green"), d.get("blue")),
@@ -403,6 +487,9 @@ def make_handler(
                     ),
                     "/api/agent/nod": lambda d: robot.nod(),
                     "/api/agent/shake": lambda d: robot.shake(),
+                    "/api/agent/dance": lambda d: dancer.start(
+                        dance_controller_url, wait_for_audio=True
+                    ),
                     "/api/agent/servo": agent_servo,
                     "/api/agent/gripper": lambda d: robot.gripper(
                         d.get("opened"), d.get("duration", 0.5)
@@ -441,6 +528,15 @@ def make_handler(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     {"ok": False, "error": str(exc)},
                 )
+            except DanceBusy as exc:
+                self._send_json(
+                    HTTPStatus.CONFLICT, {"ok": False, "error": str(exc)}
+                )
+            except DanceUnavailable as exc:
+                self._send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
             except ValueError as exc:
                 self._send_json(
                     HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -472,6 +568,7 @@ def serve(
 ) -> None:
     camera_stream = camera or CameraStream()
     ca_certificate = Path(ca_certfile).read_bytes() if ca_certfile else None
+    dance_launcher = DanceLauncher()
     handler = make_handler(
         robot,
         camera_stream,
@@ -483,6 +580,8 @@ def serve(
                 clockwise=sound_clockwise,
             ),
         ),
+        dance_launcher=dance_launcher,
+        dance_controller_url=f"http://127.0.0.1:{port}",
     )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
@@ -503,6 +602,7 @@ def serve(
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
+        dance_launcher.stop()
         server.server_close()
         if tls_server is not None:
             tls_server.shutdown()

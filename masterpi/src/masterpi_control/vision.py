@@ -198,20 +198,28 @@ class VisionGrasper:
                 "samples": samples,
                 "reason": "unstable detection",
             }
-        center_x_values = [float(item["center_x"]) for item in matching]
-        center_y_values = [float(item["center_y"]) for item in matching]
-        if (
-            max(center_x_values) - min(center_x_values) > 0.08
-            or max(center_y_values) - min(center_y_values) > 0.08
-        ):
+        center_tolerance = 0.04
+        clusters = [
+            [
+                candidate
+                for candidate in matching
+                if abs(float(candidate["center_x"]) - float(pivot["center_x"]))
+                <= center_tolerance
+                and abs(float(candidate["center_y"]) - float(pivot["center_y"]))
+                <= center_tolerance
+            ]
+            for pivot in matching
+        ]
+        stable = max(clusters, key=len)
+        if len(stable) < required:
             return {
                 "recognized": False,
                 "target": target_value,
                 "samples": samples,
                 "reason": "object moved between camera frames",
             }
-        detection = dict(max(matching, key=lambda item: item["area_ratio"]))
-        detection.update({"recognized": True, "matches": count, "samples": samples})
+        detection = dict(max(stable, key=lambda item: item["area_ratio"]))
+        detection.update({"recognized": True, "matches": len(stable), "samples": samples})
         return detection
 
     def analyze_scene(self, samples: Any = 3) -> Dict[str, Any]:
@@ -257,29 +265,57 @@ class VisionGrasper:
         time.sleep(0.52)
         self.robot.home(1.0)
 
-    def grab_front(self) -> Dict[str, Any]:
-        """Execute the fixed pickup unconditionally, without camera checks."""
+    def _perform_can_pickup(self) -> None:
+        """Use the operator-recorded direct-servo can pose and finish Home."""
+        self.robot.stop()
+        self.robot.home(0.8)
+        time.sleep(0.82)
+        self.robot.gripper(True, 0.4)
+        time.sleep(0.42)
+        for servo_id, pulse in ((3, 1550), (4, 1620), (5, 2500), (6, 1500)):
+            self.robot.servo(servo_id, pulse, 0.8)
+        time.sleep(0.82)
+        self.robot.gripper(False, 0.5)
+        time.sleep(0.52)
+        self.robot.home(1.0)
+
+    def grab_front(self, pickup: Any = "default") -> Dict[str, Any]:
+        """Execute a recorded pickup unconditionally, without camera checks."""
+        if not isinstance(pickup, str) or pickup not in ("default", "can"):
+            raise ValidationError("pickup must be default or can")
         if not self._lock.acquire(blocking=False):
             raise RobotError("A grasp is already running")
         try:
-            self._perform_fixed_pickup()
+            if pickup == "can":
+                self._perform_can_pickup()
+                mode = "recorded can pickup"
+                pickup_result: Dict[str, Any] = {
+                    "profile": "can",
+                    "servos": {"3": 1550, "4": 1620, "5": 2500, "6": 1500},
+                }
+            else:
+                self._perform_fixed_pickup()
+                mode = "fixed front pickup"
+                pickup_result = {"x": 0.0, "y": 16.5, "z": 2.0, "units": "cm"}
             return {
                 "grabbed": True,
-                "mode": "fixed front pickup",
-                "pickup": {"x": 0.0, "y": 16.5, "z": 2.0, "units": "cm"},
+                "mode": mode,
+                "pickup": pickup_result,
                 "returned_home": True,
             }
         finally:
             self.robot.stop()
             self._lock.release()
 
-    def recognize_and_grab(self, target: Any = "any") -> Dict[str, Any]:
+    def recognize_and_grab(self, target: Any = "any", pickup: Any = "default") -> Dict[str, Any]:
         """Grab a stable object centered under the gripper-mounted camera.
 
         The pickup coordinate comes from Hiwonder's color-sorting lesson. The
         function deliberately does not drive the chassis or guess depth from a
         single camera.
         """
+        if not isinstance(pickup, str) or pickup not in ("default", "can"):
+            raise ValidationError("pickup must be default or can")
         if not self._lock.acquire(blocking=False):
             raise RobotError("A camera-guided grasp is already running")
         try:
@@ -300,11 +336,21 @@ class VisionGrasper:
 
             # Fixed, table-height pickup from the vendor color-sorting course.
             # Every move is bounded and the chassis remains stopped throughout.
-            self._perform_fixed_pickup()
+            if pickup == "can":
+                self._perform_can_pickup()
+            else:
+                self._perform_fixed_pickup()
             return {
                 "grabbed": True,
                 "detection": detection,
-                "pickup": {"x": 0.0, "y": 16.5, "z": 2.0, "units": "cm"},
+                "pickup": (
+                    {
+                        "profile": "can",
+                        "servos": {"3": 1550, "4": 1620, "5": 2500, "6": 1500},
+                    }
+                    if pickup == "can"
+                    else {"x": 0.0, "y": 16.5, "z": 2.0, "units": "cm"}
+                ),
             }
         finally:
             self.robot.stop()

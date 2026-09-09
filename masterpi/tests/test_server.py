@@ -12,7 +12,12 @@ import numpy as np
 
 from masterpi_control.backends import MockBackend
 from masterpi_control.robot import Robot
-from masterpi_control.server import make_handler
+from masterpi_control.server import (
+    DanceBusy,
+    DanceLauncher,
+    DanceUnavailable,
+    make_handler,
+)
 from masterpi_control.voice_status import VoiceStatusWriter
 
 
@@ -71,13 +76,15 @@ class FakeVisionGrasper:
     def __init__(self):
         self.targets = []
         self.analysis_calls = []
+        self.front_pickups = []
 
-    def recognize_and_grab(self, target):
+    def recognize_and_grab(self, target, pickup="default"):
         self.targets.append(target)
-        return {"grabbed": True, "detection": {"color": target}}
+        return {"grabbed": True, "detection": {"color": target}, "pickup": pickup}
 
-    def grab_front(self):
-        return {"grabbed": True, "mode": "fixed front pickup", "returned_home": True}
+    def grab_front(self, pickup="default"):
+        self.front_pickups.append(pickup)
+        return {"grabbed": True, "mode": "fixed front pickup", "returned_home": True, "pickup": pickup}
 
     def analyze_scene(self, samples=3):
         self.analysis_calls.append(samples)
@@ -110,6 +117,92 @@ class FakeSoundTracker:
         }
 
 
+class FakeDanceLauncher:
+    def __init__(self):
+        self.urls = []
+
+    def start(self, controller_url, *, wait_for_audio=False):
+        self.urls.append((controller_url, wait_for_audio))
+        return {
+            "started": True,
+            "pid": 4321,
+            "audio": True,
+            "wait_for_audio": wait_for_audio,
+            "duration_seconds": 34.6,
+        }
+
+
+class FakeDanceProcess:
+    pid = 2468
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.status = 0
+        self.terminated = False
+
+    def poll(self):
+        return self.status if self.done.is_set() else None
+
+    def wait(self, timeout=None):
+        if not self.done.wait(timeout):
+            raise TimeoutError("fake dance still running")
+        return self.status
+
+    def terminate(self):
+        self.terminated = True
+        self.status = 130
+        self.done.set()
+
+
+class DanceLauncherTests(unittest.TestCase):
+    def test_launcher_runs_execute_mode_and_rejects_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "dance.py"
+            script.write_text("# test dance\n")
+            process = FakeDanceProcess()
+            popen = unittest.mock.MagicMock(return_value=process)
+            launcher = DanceLauncher(script, python="/test/python", popen=popen)
+
+            result = launcher.start("http://127.0.0.1:8000")
+            self.assertTrue(result["started"])
+            self.assertTrue(result["audio"])
+            popen.assert_called_once_with(
+                [
+                    "/test/python",
+                    str(script),
+                    "--execute",
+                    "--url",
+                    "http://127.0.0.1:8000",
+                ],
+                cwd=directory,
+            )
+            with self.assertRaises(DanceBusy):
+                launcher.start("http://127.0.0.1:8000")
+            launcher.stop()
+            self.assertTrue(process.terminated)
+
+    def test_launcher_rejects_missing_script_before_spawning(self):
+        launcher = DanceLauncher(Path("/missing/dance.py"))
+        with self.assertRaises(DanceUnavailable):
+            launcher.start("http://127.0.0.1:8000")
+
+    def test_agent_launcher_enables_audio_wait_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "dance.py"
+            script.write_text("# test dance\n")
+            process = FakeDanceProcess()
+            popen = unittest.mock.MagicMock(return_value=process)
+            launcher = DanceLauncher(script, python="/test/python", popen=popen)
+
+            result = launcher.start(
+                "http://127.0.0.1:8000", wait_for_audio=True
+            )
+
+            self.assertTrue(result["wait_for_audio"])
+            self.assertEqual(popen.call_args.args[0][-1], "--wait-for-audio")
+            launcher.stop()
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.robot = Robot(MockBackend(), watchdog_timeout=0.3)
@@ -117,6 +210,7 @@ class ServerTests(unittest.TestCase):
         self.chat = FakeChat()
         self.vision_grasper = FakeVisionGrasper()
         self.sound_tracker = FakeSoundTracker()
+        self.dance_launcher = FakeDanceLauncher()
         self.temp_directory = tempfile.TemporaryDirectory()
         self.voice_status_path = Path(self.temp_directory.name) / "voice.json"
         self.voice_status = VoiceStatusWriter(self.voice_status_path)
@@ -135,6 +229,8 @@ class ServerTests(unittest.TestCase):
                 self.vision_grasper,
                 self.sound_tracker,
                 self.voice_status_path,
+                self.dance_launcher,
+                "http://127.0.0.1:8000",
             ),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -202,13 +298,18 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b'id="quickHome"', page)
         self.assertIn(b'id="quickCheckFront"', page)
         self.assertIn(b'id="quickGrab"', page)
+        self.assertIn(b'id="quickGrabCan"', page)
+        self.assertIn(b'>Grab can</button>', page)
         self.assertIn(b'id="quickOpen"', page)
         self.assertIn(b'id="quickClose"', page)
         self.assertIn(b'id="quickNod"', page)
         self.assertIn(b'id="quickShake"', page)
+        self.assertIn(b'id="quickDance"', page)
         self.assertIn(b"'gesture/nod'", page)
         self.assertIn(b"'gesture/shake'", page)
+        self.assertIn(b"api('dance')", page)
         self.assertIn(b"api('grab', {force:true})", page)
+        self.assertIn(b"api('grab', {force:true, pickup:'can'})", page)
         self.assertIn(b"'pose/check_front'", page)
         self.assertIn(b"arm returned Home", page)
         self.assertEqual(page.count(b'class="quick-arm-preset secondary"'), 0)
@@ -319,7 +420,7 @@ class ServerTests(unittest.TestCase):
         servo_events = [event for event in self.robot.backend.events if event["action"] == "servo"]
         self.assertEqual(
             [(event["servo_id"], event["pulse"]) for event in servo_events],
-            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
         )
 
     def test_explicit_color_detection_uses_local_analyzer_without_pose(self):
@@ -509,7 +610,7 @@ class ServerTests(unittest.TestCase):
         result = json.loads(payload)["result"]
         self.assertEqual(
             [(item["servo_id"], item["pulse"]) for item in result["servos"]],
-            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
         )
 
         status, payload = self.request(
@@ -519,7 +620,7 @@ class ServerTests(unittest.TestCase):
         result = json.loads(payload)["result"]
         self.assertEqual(
             [(item["servo_id"], item["pulse"]) for item in result["servos"]],
-            [(3, 500), (4, 2500), (5, 1350), (6, 1500)],
+            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
         )
 
     def test_camera_guided_grab_api(self):
@@ -543,6 +644,16 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(result["mode"], "fixed front pickup")
         self.assertEqual(self.vision_grasper.targets, [])
 
+    def test_forced_can_grab_uses_recorded_can_pickup(self):
+        status, payload = self.request(
+            "POST", "/api/grab", {"force": True, "pickup": "can"}
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertTrue(result["grabbed"])
+        self.assertEqual(result["pickup"], "can")
+        self.assertEqual(self.vision_grasper.front_pickups, ["can"])
+
     def test_nod_gesture_api(self):
         with patch("masterpi_control.robot.time.sleep"):
             status, payload = self.request("POST", "/api/gesture/nod", {})
@@ -555,6 +666,40 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload)["result"], {"gesture": "shake", "cycles": 2})
         self.assertEqual(self.robot.snapshot()["arm"]["x"], 0.0)
+
+    def test_dance_api_starts_bundled_choreography(self):
+        status, payload = self.request("POST", "/api/dance", {})
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertTrue(result["started"])
+        self.assertTrue(result["audio"])
+        self.assertEqual(result["duration_seconds"], 34.6)
+        self.assertEqual(
+            self.dance_launcher.urls,
+            [("http://127.0.0.1:8000", False)],
+        )
+
+        status, payload = self.request("POST", "/api/agent/dance", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["result"]["started"])
+        self.assertTrue(json.loads(payload)["result"]["wait_for_audio"])
+        self.assertEqual(
+            self.dance_launcher.urls,
+            [
+                ("http://127.0.0.1:8000", False),
+                ("http://127.0.0.1:8000", True),
+            ],
+        )
+
+    def test_dance_api_reports_conflict_while_dance_is_active(self):
+        with patch.object(
+            self.dance_launcher,
+            "start",
+            side_effect=DanceBusy("A dance is already running"),
+        ):
+            status, payload = self.request("POST", "/api/dance", {})
+        self.assertEqual(status, 409)
+        self.assertIn("already running", json.loads(payload)["error"])
 
     def test_validation_error_is_400(self):
         status, payload = self.request(

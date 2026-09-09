@@ -1,5 +1,22 @@
 # Dance program progress
 
+## 2026-09-09
+
+- Switched synchronized playback to the new 30.016-second
+  `dance_move_1.mp4` soundtrack.
+- Extended `dance_score.json` from 20 to 30 seconds. The added ending uses the
+  existing calibrated poses for alternating waves, turn-and-reach sweeps, a
+  low bow, and a raised open-claw finish, with an explicit chassis stop at
+  30 seconds.
+- Updated offline timing expectations and the web/MCP launcher's advertised
+  total runtime to 34.6 seconds, including Home setup and countdown.
+- Removed the redundant `dance_1.py` copy and retired `dance_move.mp4`; the
+  single production entry point is now `dance.py` with `dance_move_1.mp4`.
+- Verification passes 17 executable dance tests plus the full 138-test
+  MasterPi suite; one optional vendor-SDK location check is skipped. FFmpeg
+  decoded the complete new soundtrack successfully. No physical motion or
+  speaker playback was invoked.
+
 ## 2026-09-07
 
 - Added synchronized playback of the AAC audio track embedded in
@@ -14,9 +31,13 @@
   FFmpeg chains valid `atempo` filters for the full supported 0.25–1 range.
 - Added `--no-audio` for silent execution and `--audio-device` for overriding
   the ALSA destination.
-- Verification passes 15 offline tests plus Python compilation; the optional
+- Verification passes 17 offline tests plus Python compilation; the optional
   vendor-source IK test is skipped because its expected SDK path is absent. No
   physical motion or speaker playback was triggered during verification.
+- Fixed MCP/voice-triggered silent dances caused by the realtime reply and
+  soundtrack competing for the ReSpeaker's exclusive ALSA playback device.
+  `--wait-for-audio` now probes for two consecutive available intervals before
+  establishing `GO`, so music and motion remain synchronized after voice TTS.
 
 ## 2026-09-05
 
@@ -66,15 +87,19 @@ Arm coordinates and chassis headings in the score are robot-relative.
 | 11.5–14 s | Turn side-on, bow and lift, turn back | Bounded yaw, low-front/reach poses, opposing yaw |
 | 14–17.5 s | Raised-claw sway followed by low sweeping bow | Salute with yaw pulses, then low-right sweep |
 | 17.5–19.5 s | Rise, approach, final claw gesture | Home, forward pulse, wave and claw pulse |
-| 19.5–20 s | High diagonal claw finish | Salute-left pose and short yaw; stop at 20 s |
+| 19.5–20 s | High diagonal claw accent | Salute-left pose and short yaw; stop at 20 s |
+| 20–21.75 s | Alternating raised-arm waves | Right/left wave, salute, then center |
+| 21.75–24.75 s | Turn-and-reach phrase with low bow | Opposing yaw pulses, reach poses, then low sweep |
+| 24.75–27.5 s | Repeated turns and waves | Left/right/left yaw with alternating raised arm |
+| 27.5–30 s | Rise into open-claw finale | Home, salute, diagonal finish, claw pulse, then stop |
 
 This is an executable approximation of the clip's gesture order and timing,
 not recovered joint telemetry. Fast turns have reduced amplitude to keep wheel
 commands bounded; the side-on labels describe the source phrase, not a verified
 90-degree result. Translation distances and rotations need physical tuning.
-No audio analysis or automatic music playback is included. The timeline follows
-visible motions, not an estimated musical beat. The last 0.010 s of container
-duration is rounded away.
+The timeline follows visible motions, not recovered joint telemetry. Execution
+automatically decodes and plays the MP4's AAC soundtrack through the ReSpeaker;
+the final 0.016 seconds beyond the rounded 30-second score are allowed to drain.
 
 ## Run instructions
 
@@ -99,10 +124,10 @@ arm-control programs during the dance. From the computer containing `dance.py`
 and `dance_score.json`, use the server's real address in place of `ROBOT_IP`:
 
 ```bash
-# First arm-only test, taking 40 seconds plus setup:
+# First arm-only test, taking 60 seconds plus setup:
 python3 dance.py --execute --url http://ROBOT_IP:8000 --arm-only --tempo 0.5
 
-# Full 20-second choreography plus setup and synchronized MP4 audio:
+# Full 30-second choreography plus setup and synchronized MP4 audio:
 python3 dance.py --execute --url http://ROBOT_IP:8000
 
 # Optional silent execution:

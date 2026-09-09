@@ -38,6 +38,12 @@ def shake() -> dict[str, Any]:
 
 
 @mcp.tool()
+def dance() -> dict[str, Any]:
+    """Start hibot's bundled choreography with synchronized music."""
+    return dispatch_robot_tool(client, "dance")
+
+
+@mcp.tool()
 def home_arm(duration: float = 1.5) -> dict[str, Any]:
     """Move hibot's arm to its documented Home pose."""
     return dispatch_robot_tool(client, "home_arm", {"duration": duration})

@@ -18,6 +18,7 @@ class RobotToolDispatcherTests(unittest.TestCase):
         by_name = {schema["name"]: schema for schema in schemas}
 
         self.assertIn("check_front", by_name)
+        self.assertIn("dance", by_name)
         self.assertIn("recognize_and_grab", by_name)
         self.assertIn("analyze_camera", by_name)
         self.assertIn("analyze_camera_color", by_name)
@@ -28,6 +29,7 @@ class RobotToolDispatcherTests(unittest.TestCase):
         self.assertTrue(
             all(not schema["parameters"]["additionalProperties"] for schema in schemas)
         )
+        self.assertEqual(by_name["dance"]["parameters"]["properties"], {})
 
     def test_dispatch_applies_defaults_and_uses_loopback_action(self):
         client = FakeClient()
@@ -40,6 +42,10 @@ class RobotToolDispatcherTests(unittest.TestCase):
             [("drive_for", {"direction": "forward", "duration": 1, "speed": 40})],
         )
         self.assertEqual(result["action"], "drive_for")
+
+        result = dispatcher.dispatch("dance")
+        self.assertEqual(client.calls[-1], ("dance", None))
+        self.assertEqual(result["action"], "dance")
 
     def test_led_target_routes_to_sonar_and_is_not_forwarded(self):
         client = FakeClient()
