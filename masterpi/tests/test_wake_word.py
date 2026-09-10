@@ -218,6 +218,23 @@ class WakeWordTests(unittest.TestCase):
         self.assertEqual(wav[:4], b"RIFF")
         self.assertEqual(wav[8:12], b"WAVE")
 
+    def test_utterance_recorder_logs_timeout_noise_levels(self):
+        source = FrameSource([pcm_frame(180), pcm_frame(220), pcm_frame(200)])
+        recorder = UtteranceRecorder(
+            speech_threshold=400,
+            silence_seconds=0.24,
+            max_seconds=1,
+        )
+
+        with self.assertLogs(level="INFO") as messages:
+            pcm = recorder.capture(source, start_timeout=0.24)
+
+        self.assertIsNone(pcm)
+        output = "\n".join(messages.output)
+        self.assertIn("reason=start_timeout", output)
+        self.assertIn("threshold=400", output)
+        self.assertIn("rms_median=200", output)
+
     def test_voice_conversation_accepts_followup_until_goodbye(self):
         source = FakeSource()
 

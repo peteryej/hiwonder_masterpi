@@ -251,7 +251,7 @@ class VisionGrasper:
         }
 
     def _perform_fixed_pickup(self) -> None:
-        """Run the fixed front pickup pose and finish at Home."""
+        """Run the fixed ground-level pickup pose and finish at Home."""
         self.robot.stop()
         self.robot.home(0.8)
         time.sleep(0.82)
@@ -259,7 +259,10 @@ class VisionGrasper:
         time.sleep(0.42)
         self.robot.arm(0, 16.5, 8, -90, -90, 0, 0.8)
         time.sleep(0.82)
-        self.robot.arm(0, 16.5, 2, -90, -90, 0, 0.5)
+        # At z=0 the closest solution to -90 degrees would push calibrated
+        # servo 5 just past 2500. A -66-degree target preserves the downward
+        # pickup orientation while keeping every calibrated pulse in range.
+        self.robot.arm(0, 16.5, 0, -66, -66, 0, 0.5)
         time.sleep(0.52)
         self.robot.gripper(False, 0.5)
         time.sleep(0.52)
@@ -295,8 +298,8 @@ class VisionGrasper:
                 }
             else:
                 self._perform_fixed_pickup()
-                mode = "fixed front pickup"
-                pickup_result = {"x": 0.0, "y": 16.5, "z": 2.0, "units": "cm"}
+                mode = "fixed ground pickup"
+                pickup_result = {"x": 0.0, "y": 16.5, "z": 0.0, "units": "cm"}
             return {
                 "grabbed": True,
                 "mode": mode,
@@ -349,7 +352,7 @@ class VisionGrasper:
                         "servos": {"3": 1550, "4": 1620, "5": 2500, "6": 1500},
                     }
                     if pickup == "can"
-                    else {"x": 0.0, "y": 16.5, "z": 2.0, "units": "cm"}
+                    else {"x": 0.0, "y": 16.5, "z": 0.0, "units": "cm"}
                 ),
             }
         finally:

@@ -40,14 +40,16 @@ Always identify yourself as HiBot when asked who you are. You have a four-wheel
 mecanum chassis, a six-servo arm with a gripper, a camera mounted above the
 gripper, a front ultrasonic sensor, controllable LEDs and buzzer, and a
 ReSpeaker USB four-microphone array connected to a speaker. You have tools for
-reading robot state, driving, moving the arm, checking the camera, grabbing the
-object directly in front, dancing with synchronized music, following sound, and
-controlling LEDs and the buzzer.
+reading robot state, driving, moving the arm, checking the camera, grabbing an
+object from the ground or with the recorded front can pose, dancing with
+synchronized music, following sound, and controlling LEDs and the buzzer.
 Call a physical-control tool only when the user explicitly asks you to perform
 that action. Never say an action succeeded until its tool result confirms it.
-Use the stop tool immediately when the user asks you to stop. The grab tool is
-an unconditional quick action and must not be preceded by a color check. For a
-camera question, use analyze_camera unless the user explicitly asks for color
+Use the stop tool immediately when the user asks you to stop. Both grab tools
+are unconditional quick actions and must not be preceded by a color check. Use
+grab_from_front for the same motion as the webpage's Grab can button, and
+grab_from_ground for the low ground pickup. For a camera question, use
+analyze_camera unless the user explicitly asks for color
 detection, in which case use analyze_camera_color. Speak naturally and
 concisely, normally in one or two short sentences. Do not use Markdown or read
 punctuation aloud."""
@@ -678,12 +680,23 @@ class RealtimeVoiceConversation:
                 capture_seconds = self._clock() - capture_started
                 if pcm is None:
                     silent_cycles += 1
+                    logging.info(
+                        "Realtime capture found no speech (%d/%d) after %.2f s",
+                        silent_cycles,
+                        self.max_silent_cycles,
+                        capture_seconds,
+                    )
+                    self._status(
+                        "step",
+                        "listening",
+                        f"No speech heard ({silent_cycles}/{self.max_silent_cycles}).",
+                        tool="ALSA · ReSpeaker USB 4 Mic Array",
+                    )
                     if silent_cycles >= self.max_silent_cycles:
                         return
                     timeout = self.followup_timeout
                     continue
 
-                silent_cycles = 0
                 turns += 1
                 transcript_published = False
 
@@ -782,6 +795,29 @@ class RealtimeVoiceConversation:
                     result.total_seconds,
                     result.audio_seconds,
                 )
+                if not result.transcript.strip():
+                    silent_cycles += 1
+                    logging.warning(
+                        "Realtime returned an empty transcript for %.2f s of captured audio "
+                        "(%d/%d)",
+                        len(pcm) / (INPUT_SAMPLE_RATE * 2),
+                        silent_cycles,
+                        self.max_silent_cycles,
+                    )
+                    self._status(
+                        "step",
+                        "listening",
+                        f"No words recognized ({silent_cycles}/{self.max_silent_cycles}).",
+                        tool=(
+                            "OpenAI Realtime · "
+                            f"{getattr(self.client, 'transcription_model', 'input transcription')}"
+                        ),
+                    )
+                    if silent_cycles >= self.max_silent_cycles:
+                        return
+                    timeout = self.followup_timeout
+                    continue
+                silent_cycles = 0
                 if self._is_exit(result.transcript):
                     return
                 timeout = self.followup_timeout

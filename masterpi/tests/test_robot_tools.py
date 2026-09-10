@@ -19,7 +19,9 @@ class RobotToolDispatcherTests(unittest.TestCase):
 
         self.assertIn("check_front", by_name)
         self.assertIn("dance", by_name)
-        self.assertIn("recognize_and_grab", by_name)
+        self.assertIn("grab_from_ground", by_name)
+        self.assertIn("grab_from_front", by_name)
+        self.assertNotIn("recognize_and_grab", by_name)
         self.assertIn("analyze_camera", by_name)
         self.assertIn("analyze_camera_color", by_name)
         self.assertEqual(
@@ -46,6 +48,11 @@ class RobotToolDispatcherTests(unittest.TestCase):
         result = dispatcher.dispatch("dance")
         self.assertEqual(client.calls[-1], ("dance", None))
         self.assertEqual(result["action"], "dance")
+
+        dispatcher.dispatch("grab_from_ground")
+        self.assertEqual(client.calls[-1], ("grab_from_ground", None))
+        dispatcher.dispatch("grab_from_front")
+        self.assertEqual(client.calls[-1], ("grab_from_front", None))
 
     def test_led_target_routes_to_sonar_and_is_not_forwarded(self):
         client = FakeClient()

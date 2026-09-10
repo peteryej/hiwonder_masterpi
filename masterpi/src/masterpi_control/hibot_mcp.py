@@ -74,9 +74,15 @@ def set_gripper(opened: bool, duration: float = 0.5) -> dict[str, Any]:
 
 
 @mcp.tool()
-def recognize_and_grab() -> dict[str, Any]:
-    """Unconditionally grab the object directly in front and return Home."""
-    return dispatch_robot_tool(client, "recognize_and_grab")
+def grab_from_ground() -> dict[str, Any]:
+    """Pick up an object from the fixed ground-level coordinate and return Home."""
+    return dispatch_robot_tool(client, "grab_from_ground")
+
+
+@mcp.tool()
+def grab_from_front() -> dict[str, Any]:
+    """Run the webpage Grab can front-pickup pose and return Home."""
+    return dispatch_robot_tool(client, "grab_from_front")
 
 
 @mcp.tool()

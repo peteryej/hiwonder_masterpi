@@ -120,9 +120,15 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
         ),
     ),
     RobotToolDefinition(
-        "recognize_and_grab",
-        "Unconditionally grab the object directly in front of HiBot and return the arm Home.",
-        "grab",
+        "grab_from_ground",
+        "Unconditionally pick up an object from HiBot's fixed ground-level coordinate and return the arm Home while holding it.",
+        "grab_from_ground",
+        _object_schema(),
+    ),
+    RobotToolDefinition(
+        "grab_from_front",
+        "Unconditionally run the recorded front can-pickup servo pose used by the webpage's Grab can quick action, then return the arm Home while holding it.",
+        "grab_from_front",
         _object_schema(),
     ),
     RobotToolDefinition(

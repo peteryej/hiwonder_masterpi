@@ -84,7 +84,8 @@ class FakeVisionGrasper:
 
     def grab_front(self, pickup="default"):
         self.front_pickups.append(pickup)
-        return {"grabbed": True, "mode": "fixed front pickup", "returned_home": True, "pickup": pickup}
+        mode = "recorded can pickup" if pickup == "can" else "fixed ground pickup"
+        return {"grabbed": True, "mode": mode, "returned_home": True, "pickup": pickup}
 
     def analyze_scene(self, samples=3):
         self.analysis_calls.append(samples)
@@ -332,6 +333,24 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b"api('servo'", page)
         self.assertIn(b"Target position of the gripper tip", page)
         self.assertIn(b"positive moves right", page)
+        self.assertIn(b'class="arm-jog-controls"', page)
+        self.assertEqual(page.count(b'class="arm-jog secondary"'), 8)
+        for control_id in (
+            "armYUp",
+            "armYDown",
+            "armXLeft",
+            "armXRight",
+            "armZUp",
+            "armZDown",
+            "armGripClose",
+            "armGripOpen",
+        ):
+            self.assertIn(f'id="{control_id}"'.encode(), page)
+        self.assertIn(b"jogAxis('y', 0.5)", page)
+        self.assertIn(b"jogAxis('x', -0.5)", page)
+        self.assertIn(b"jogAxis('z', 0.5)", page)
+        self.assertIn(b"jogGripper(false)", page)
+        self.assertIn(b"jogGripper(true)", page)
         self.assertNotIn(b"Accepted limits:", page)
         self.assertGreater(page.find(b"Arm position (cm)"), page.find(b"LEDs and buzzer"))
         self.assertIn(b'id="armStatus"', page)
@@ -629,19 +648,29 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(json.loads(payload)["result"]["grabbed"])
         self.assertEqual(self.vision_grasper.targets, ["blue"])
 
-        status, payload = self.request("POST", "/api/agent/grab", {"target": "red"})
+        status, payload = self.request("POST", "/api/agent/grab_from_ground", {})
         self.assertEqual(status, 200)
         result = json.loads(payload)["result"]
-        self.assertEqual(result["mode"], "fixed front pickup")
+        self.assertEqual(result["mode"], "fixed ground pickup")
         self.assertTrue(result["returned_home"])
+        self.assertEqual(self.vision_grasper.front_pickups, ["default"])
         self.assertEqual(self.vision_grasper.targets, ["blue"])
+
+        status, payload = self.request("POST", "/api/agent/grab_from_front", {})
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertTrue(result["returned_home"])
+        self.assertEqual(self.vision_grasper.front_pickups, ["default", "can"])
+
+        status, _payload = self.request("POST", "/api/agent/grab", {})
+        self.assertEqual(status, 404)
 
     def test_forced_front_grab_skips_recognition(self):
         status, payload = self.request("POST", "/api/grab", {"force": True})
         self.assertEqual(status, 200)
         result = json.loads(payload)["result"]
         self.assertTrue(result["grabbed"])
-        self.assertEqual(result["mode"], "fixed front pickup")
+        self.assertEqual(result["mode"], "fixed ground pickup")
         self.assertEqual(self.vision_grasper.targets, [])
 
     def test_forced_can_grab_uses_recorded_can_pickup(self):

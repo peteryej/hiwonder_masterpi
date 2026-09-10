@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import subprocess
 import sys
@@ -28,6 +29,7 @@ FRAME_SAMPLES = 1_280  # openWakeWord's preferred 80 ms frame at 16 kHz.
 FRAME_BYTES = FRAME_SAMPLES * 2
 DEFAULT_CAPTURE_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"
 DEFAULT_PLAYBACK_DEVICE = DEFAULT_CAPTURE_DEVICE
+DEFAULT_DIAGNOSTIC_LOG = Path.home() / ".local/state/masterpi/voice-diagnostics.log"
 FEATURE_MODEL_URLS = {
     "melspectrogram.onnx": (
         "https://github.com/dscripka/openWakeWord/releases/download/"
@@ -287,34 +289,76 @@ class UtteranceRecorder:
         pre_roll: deque[bytes] = deque(maxlen=self.pre_roll_frames)
         frames: list[bytes] = []
         consecutive_speech = 0
+        pre_speech_levels: list[float] = []
 
         for _ in range(start_limit):
             frame = source.read()
             pre_roll.append(frame)
             rms = self._rms(frame)
+            pre_speech_levels.append(rms)
             consecutive_speech = consecutive_speech + 1 if rms >= threshold else 0
             if consecutive_speech >= self.speech_start_frames:
                 frames.extend(pre_roll)
-                logging.info("speech started (RMS %.0f)", rms)
+                logging.info(
+                    "speech started: rms=%.0f threshold=%.0f wait=%.2f s",
+                    rms,
+                    threshold,
+                    len(pre_speech_levels) * 0.08,
+                )
                 if on_speech_start is not None:
                     on_speech_start()
                 break
             if stop_when is not None and stop_when():
                 return None
         else:
+            median, percentile_95, maximum = self._level_summary(pre_speech_levels)
+            logging.info(
+                "utterance capture ended: reason=start_timeout wait=%.2f s "
+                "threshold=%.0f rms_median=%.0f rms_p95=%.0f rms_max=%.0f",
+                len(pre_speech_levels) * 0.08,
+                threshold,
+                median,
+                percentile_95,
+                maximum,
+            )
             return None
 
         consecutive_silence = 0
+        recording_levels: list[float] = []
+        reason = "max_duration"
         for _ in range(max(0, self.max_frames - len(frames))):
             frame = source.read()
             frames.append(frame)
-            if self._rms(frame) < threshold:
+            rms = self._rms(frame)
+            recording_levels.append(rms)
+            if rms < threshold:
                 consecutive_silence += 1
                 if consecutive_silence >= self.silence_frames:
+                    reason = "ending_silence"
                     break
             else:
                 consecutive_silence = 0
+        trailing = recording_levels[-self.silence_frames :]
+        median, percentile_95, maximum = self._level_summary(trailing)
+        logging.info(
+            "utterance capture ended: reason=%s wait=%.2f s audio=%.2f s "
+            "threshold=%.0f tail_rms_median=%.0f tail_rms_p95=%.0f tail_rms_max=%.0f",
+            reason,
+            len(pre_speech_levels) * 0.08,
+            len(frames) * 0.08,
+            threshold,
+            median,
+            percentile_95,
+            maximum,
+        )
         return b"".join(frames)
+
+    @staticmethod
+    def _level_summary(levels: Sequence[float]) -> tuple[float, float, float]:
+        if not levels:
+            return 0.0, 0.0, 0.0
+        values = np.asarray(levels, dtype=np.float64)
+        return float(np.median(values)), float(np.percentile(values, 95)), float(np.max(values))
 
 
 class HermesReplySpeaker:
@@ -866,6 +910,26 @@ def _default_project_path(*parts: str) -> Path:
     return Path(__file__).resolve().parents[2].joinpath(*parts)
 
 
+def _enable_diagnostic_log(path: Path) -> None:
+    """Keep recent voice diagnostics even when the user journal is volatile."""
+
+    target = Path(path).expanduser()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            target,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logging.warning("could not open voice diagnostic log %s: %s", target, exc)
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.info("voice diagnostic log: %s", target)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="masterpi-wake-word",
@@ -903,13 +967,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--realtime-model", default="gpt-realtime-2.1")
     parser.add_argument("--realtime-voice", default="marin")
-    parser.add_argument("--speech-threshold", type=float, default=200)
+    parser.add_argument("--speech-threshold", type=float, default=400)
     parser.add_argument("--speech-silence", type=float, default=3.0)
     parser.add_argument("--speech-start-timeout", type=float, default=15)
-    parser.add_argument("--followup-timeout", type=float, default=15)
-    parser.add_argument("--max-utterance", type=float, default=120)
+    parser.add_argument("--followup-timeout", type=float, default=8)
+    parser.add_argument("--max-utterance", type=float, default=30)
     parser.add_argument("--conversation-max-turns", type=int, default=30)
-    parser.add_argument("--max-silent-cycles", type=int, default=3)
+    parser.add_argument("--max-silent-cycles", type=int, default=2)
+    parser.add_argument(
+        "--diagnostic-log",
+        type=Path,
+        default=DEFAULT_DIAGNOSTIC_LOG,
+        help="rotating log for capture levels, end reasons, and turn timing",
+    )
     parser.add_argument(
         "--barge-in",
         action=argparse.BooleanOptionalAction,
@@ -930,6 +1000,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    _enable_diagnostic_log(args.diagnostic_log)
     try:
         if args.download_features:
             downloaded = download_feature_models(args.feature_model_dir)

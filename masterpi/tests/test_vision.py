@@ -98,8 +98,9 @@ class VisionTests(unittest.TestCase):
         arm_events = [event for event in robot.backend.events if event["action"] == "arm"]
         self.assertEqual(
             [(event["x"], event["y"], event["z"]) for event in arm_events],
-            [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 2), (0, 6, 18)],
+            [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 0), (0, 6, 18)],
         )
+        self.assertEqual(arm_events[2]["pitch"], -66)
         servo_events = [event for event in robot.backend.events if event["action"] == "servo"]
         self.assertEqual([event["pulse"] for event in servo_events], [2000, 1500])
 
@@ -116,8 +117,9 @@ class VisionTests(unittest.TestCase):
         arm_events = [event for event in robot.backend.events if event["action"] == "arm"]
         self.assertEqual(
             [(event["x"], event["y"], event["z"]) for event in arm_events],
-            [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 2), (0, 6, 18)],
+            [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 0), (0, 6, 18)],
         )
+        self.assertEqual(arm_events[2]["pitch"], -66)
 
     def test_centered_can_uses_recorded_direct_servo_pickup_pose(self):
         robot = Robot(MockBackend())

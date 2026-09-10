@@ -149,10 +149,15 @@ def make_handler(
             data.get("target", "any"), data.get("pickup", "default")
         )
 
-    def agent_grab(data: Dict[str, Any]) -> Dict[str, Any]:
+    def agent_grab_from_ground(data: Dict[str, Any]) -> Dict[str, Any]:
         if grasper is None:
             raise CameraUnavailable("Grasping is not configured")
-        return grasper.grab_front()
+        return grasper.grab_front("default")
+
+    def agent_grab_from_front(data: Dict[str, Any]) -> Dict[str, Any]:
+        if grasper is None:
+            raise CameraUnavailable("Grasping is not configured")
+        return grasper.grab_front("can")
 
     def analyze_color_camera(data: Dict[str, Any]) -> Dict[str, Any]:
         if grasper is None:
@@ -494,7 +499,8 @@ def make_handler(
                     "/api/agent/gripper": lambda d: robot.gripper(
                         d.get("opened"), d.get("duration", 0.5)
                     ),
-                    "/api/agent/grab": agent_grab,
+                    "/api/agent/grab_from_ground": agent_grab_from_ground,
+                    "/api/agent/grab_from_front": agent_grab_from_front,
                     "/api/agent/camera_analyze": analyze_hermes_camera,
                     "/api/agent/camera_analyze_color": analyze_color_camera,
                     "/api/agent/rgb": lambda d: robot.rgb(

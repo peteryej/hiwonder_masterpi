@@ -5,6 +5,15 @@ from masterpi_control import hibot_mcp
 
 
 class HibotMcpTests(unittest.TestCase):
+    def test_grab_tools_use_distinct_pickup_actions(self):
+        with patch.object(hibot_mcp.client, "call", return_value={"grabbed": True}) as call:
+            self.assertTrue(hibot_mcp.grab_from_ground()["grabbed"])
+            call.assert_called_once_with("grab_from_ground")
+
+        with patch.object(hibot_mcp.client, "call", return_value={"grabbed": True}) as call:
+            self.assertTrue(hibot_mcp.grab_from_front()["grabbed"])
+            call.assert_called_once_with("grab_from_front")
+
     def test_dance_uses_shared_async_action(self):
         expected = {"started": True, "audio": True}
         with patch.object(hibot_mcp.client, "call", return_value=expected) as call:

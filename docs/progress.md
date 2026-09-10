@@ -2,6 +2,68 @@
 
 2026-09-09
 
+## Arm-position directional controls
+
+- Added two four-direction jog pads to the webpage's **Arm position** card. The
+  left pad maps up/down to Y ±0.5 cm and left/right to X ±0.5 cm. The right pad
+  maps up/down to Z ±0.5 cm, left to fully closed gripper, and right to fully
+  open gripper.
+- Cartesian jogs use the visible X/Y/Z/pitch fields and movement duration,
+  remain within the input bounds, and restore the previous field value when
+  the validated `/api/arm` endpoint rejects an unreachable target.
+- All eight controls are disabled for the requested move interval to avoid
+  racing arm commands. Gripper controls use the existing validated 1500/2000
+  closed/open presets and update the direct servo-1 slider after success.
+- Verification passes all 141 MasterPi tests, the embedded JavaScript syntax
+  check, and `git diff --check`. The controller was restarted and the live page
+  exposes all eight controls and both jog handlers; no arm command was sent.
+
+## Separate ground and front MCP grabs
+
+- Renamed the previous unconditional MCP/Realtime grab to `grab_from_ground`.
+  It uses the low Cartesian pickup coordinate `(0, 16.5, 0)` cm and returns
+  Home while holding the object.
+- Lowered the ground-grab contact height from `z=2` to `z=0` cm at the user's
+  request. The contact pitch is `-66°`, whose calibrated IK solution remains
+  inside the 500–2500 servo range; the `z=8` cm approach point and front-can
+  servo profile are unchanged.
+- Added `grab_from_front`, which uses the exact operator-recorded servo profile
+  behind the webpage's **Grab can** action: servos 3–6 at `1550`, `1620`,
+  `2500`, and `1500`, then gripper close and Home.
+- Added distinct loopback-only `/api/agent/grab_from_ground` and
+  `/api/agent/grab_from_front` routes. The former `recognize_and_grab` tool and
+  `/api/agent/grab` route are no longer exposed; neither replacement performs
+  camera/color checks.
+- Verification passes all 141 MasterPi tests. The controller, Realtime
+  wake-word service, and Hermes gateway were restarted without moving the
+  robot. Hermes now caches 19 HiBot tools, including both new grabs and no old
+  `recognize_and_grab` entry.
+- Offline vendor IK resolves the new `(0, 16.5, 0)` contact pose at `-66°` to
+  calibrated servo pulses approximately `963`, `1814`, `2470`, and `1564`, all
+  within 500–2500. The controller was reloaded without executing the arm.
+
+## Bounded voice listening and capture diagnostics
+
+- Diagnosed the latest apparent listening stall. The question capture ended in
+  4.64 seconds, but Realtime returned an empty input transcript and the old
+  configuration then waited through three 15-second follow-up windows (46.64
+  seconds total). CPU pressure was ruled out: the four-core Pi remained
+  62–77% idle with no swap, I/O wait, thermal throttling, or ALSA stream error.
+- Raised the normal utterance threshold from RMS 200 to 400, reduced the hard
+  utterance limit from 120 to 30 seconds, and reduced idle follow-up handling
+  from three 15-second windows to two 8-second windows.
+- Empty Realtime transcripts now count toward the same two-cycle silence limit,
+  and the webpage reports **No words recognized** or **No speech heard** rather
+  than displaying an undifferentiated listening state.
+- Added a rotating persistent diagnostic log at
+  `~/.local/state/masterpi/voice-diagnostics.log`. It records threshold, RMS
+  median/95th-percentile/maximum, speech-start delay, captured duration,
+  termination reason, empty transcripts, and Realtime stage timing.
+- Verification passes all 141 MasterPi tests. The packaged user unit was
+  installed and restarted; systemd confirms the listener and ReSpeaker capture
+  are active with RMS 400, 30-second capture, 8-second follow-up, and two-cycle
+  limits. The persistent diagnostic log was created successfully.
+
 ## Extended dance soundtrack and choreography
 
 - Updated `robot_choregraph/dance.py` to play `dance_move_1.mp4`, whose AAC
@@ -59,8 +121,8 @@
   response), caps a turn at four tool rounds, and reports each action and its
   elapsed time in the webpage voice feed.
 - Exposed `check_front` consistently through MCP, Realtime, and
-  `/api/agent/check_front`. `recognize_and_grab` retains the requested
-  unconditional front pickup with no color guardrail. Large annotated camera
+  `/api/agent/check_front`. The unconditional grab tools have no color
+  guardrail. Large annotated camera
   image data is omitted from the model's tool-result context while semantic
   detections remain available, avoiding unnecessary latency and context use.
 - Replaced the agent client's universal 15-second HTTP deadline with an

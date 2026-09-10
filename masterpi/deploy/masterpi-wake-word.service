@@ -13,7 +13,7 @@ Environment=PYTHONPATH=/home/pi/projs/hiwonder_masterpi/masterpi/src
 Environment=HOME=/home/pi
 EnvironmentFile=-/home/pi/.config/masterpi/openai.env
 EnvironmentFile=-/home/pi/projs/hiwonder_masterpi/.env
-ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.wakeword-venv/bin/python -m masterpi_control.wake_word --conversation --conversation-backend realtime --realtime-model gpt-realtime-2.1 --threshold 0.5 --speech-threshold 200 --speech-silence 3 --speech-start-timeout 15 --followup-timeout 15 --max-utterance 120 --conversation-max-turns 30 --max-silent-cycles 3 --no-barge-in
+ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.wakeword-venv/bin/python -m masterpi_control.wake_word --conversation --conversation-backend realtime --realtime-model gpt-realtime-2.1 --threshold 0.5 --speech-threshold 400 --speech-silence 3 --speech-start-timeout 15 --followup-timeout 8 --max-utterance 30 --conversation-max-turns 30 --max-silent-cycles 2 --no-barge-in
 Restart=on-failure
 RestartPreventExitStatus=2
 RestartSec=2

@@ -86,6 +86,13 @@
     .axis-guide { display: grid; grid-template-columns: auto 1fr; gap: 5px 10px; margin: 0 0 14px; font-size: .84rem; }
     .axis-guide dt { color: #88a9ff; font-weight: 700; }
     .axis-guide dd { margin: 0; color: #b9c5d4; }
+    .arm-jog-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+    .arm-jog-group { min-width: 0; padding: 10px 6px; border: 1px solid #2d3948; border-radius: 10px; background: #141c27; }
+    .arm-jog-group strong { display: block; margin-bottom: 8px; color: #b9c5d4; font-size: .82rem; text-align: center; }
+    .arm-jog-pad { display: grid; grid-template-columns: repeat(3, minmax(32px, 44px)); gap: 5px; justify-content: center; align-items: center; }
+    .arm-jog-pad button { min-width: 0; padding: 9px 2px; border-radius: 8px; }
+    .arm-jog-pad .empty { visibility: hidden; }
+    .arm-jog-center { color: #88a9ff; font-size: .72rem; font-weight: 700; text-align: center; }
     .arm-status { min-height: 34px; margin-top: 12px; padding: 8px 10px; border-radius: 8px; background: #182c24; color: #88edb5; font-size: .86rem; }
     .arm-status.error { background: #351e24; color: #ff9daa; }
     .servo-controls { display: grid; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #2d3948; }
@@ -110,6 +117,10 @@
       .quick-arm-panel h3 { font-size: .82rem; }
       .quick-controls { grid-template-columns: 1fr; gap: 5px; }
       .quick-controls button { padding: 7px 3px; font-size: .7rem; }
+      .arm-jog-controls { gap: 8px; }
+      .arm-jog-group { padding: 8px 3px; }
+      .arm-jog-pad { grid-template-columns: repeat(3, minmax(28px, 38px)); gap: 3px; }
+      .arm-jog-pad button { padding: 7px 1px; }
       .chat-compose { grid-template-columns: 1fr auto; }
       #recordAudio { grid-column: 1 / -1; }
     }
@@ -219,6 +230,24 @@
       <div class="fields" style="margin-top:9px">
         <label>Pitch<input id="pitch" type="number" value="0" min="-90" max="90"></label>
         <label>Seconds<input id="armDuration" type="number" value="1" min="0.02" max="30" step="0.1"></label>
+      </div>
+      <div class="arm-jog-controls" aria-label="Arm directional controls">
+        <div class="arm-jog-group">
+          <strong>X / Y position · 0.5 cm</strong>
+          <div class="arm-jog-pad">
+            <span class="empty" aria-hidden="true"></span><button id="armYUp" class="arm-jog secondary" aria-label="Increase Y" title="Increase Y">▲</button><span class="empty" aria-hidden="true"></span>
+            <button id="armXLeft" class="arm-jog secondary" aria-label="Decrease X" title="Decrease X">◀</button><span class="arm-jog-center">X / Y</span><button id="armXRight" class="arm-jog secondary" aria-label="Increase X" title="Increase X">▶</button>
+            <span class="empty" aria-hidden="true"></span><button id="armYDown" class="arm-jog secondary" aria-label="Decrease Y" title="Decrease Y">▼</button><span class="empty" aria-hidden="true"></span>
+          </div>
+        </div>
+        <div class="arm-jog-group">
+          <strong>Z / gripper · 0.5 cm</strong>
+          <div class="arm-jog-pad">
+            <span class="empty" aria-hidden="true"></span><button id="armZUp" class="arm-jog secondary" aria-label="Increase Z" title="Increase Z">▲</button><span class="empty" aria-hidden="true"></span>
+            <button id="armGripClose" class="arm-jog secondary" aria-label="Close gripper" title="Close gripper">◀</button><span class="arm-jog-center">Z / grip</span><button id="armGripOpen" class="arm-jog secondary" aria-label="Fully open gripper" title="Fully open gripper">▶</button>
+            <span class="empty" aria-hidden="true"></span><button id="armZDown" class="arm-jog secondary" aria-label="Decrease Z" title="Decrease Z">▼</button><span class="empty" aria-hidden="true"></span>
+          </div>
+        </div>
       </div>
       <div class="row"><button id="moveArm">Move arm</button><button id="home" class="secondary">Home</button></div>
       <div class="row"><button id="open" class="secondary">Open gripper</button><button id="close" class="secondary">Close gripper</button></div>
@@ -583,8 +612,10 @@
     try {
       await api(path, values);
       setArmStatus(successMessage);
+      return true;
     } catch (error) {
       setArmStatus(error.message, true);
+      return false;
     }
   }
   function moveArm() {
@@ -592,6 +623,64 @@
     return sendArmCommand('arm', values, `Position accepted: X ${values.x}, Y ${values.y}, Z ${values.z}, pitch ${values.pitch}°.`);
   }
   document.querySelector('#moveArm').onclick = moveArm;
+  let armJogBusy = false;
+  const armJogButtons = [...document.querySelectorAll('.arm-jog')];
+  const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  async function runArmJog(command, settleSeconds) {
+    if (armJogBusy) return;
+    armJogBusy = true;
+    armJogButtons.forEach(button => { button.disabled = true; });
+    try {
+      const accepted = await command();
+      if (accepted) await wait(Math.max(0, settleSeconds) * 1000);
+    } finally {
+      armJogBusy = false;
+      armJogButtons.forEach(button => { button.disabled = false; });
+    }
+  }
+  function jogAxis(axis, delta) {
+    const input = document.querySelector('#' + axis);
+    const previous = +input.value;
+    const minimum = +input.min;
+    const maximum = +input.max;
+    const next = Math.min(maximum, Math.max(minimum, Math.round((previous + delta) * 2) / 2));
+    if (next === previous) {
+      setArmStatus(`${axis.toUpperCase()} is already at its input limit.`);
+      return;
+    }
+    runArmJog(async () => {
+      input.value = next;
+      const accepted = await moveArm();
+      if (!accepted) input.value = previous;
+      return accepted;
+    }, n('armDuration'));
+  }
+  function setServoSliderValue(servoId, pulse) {
+    const slider = document.querySelector(`#servo${servoId}`);
+    const output = document.querySelector(`output[for="servo${servoId}"]`);
+    slider.value = pulse;
+    output.value = pulse;
+    output.textContent = pulse;
+  }
+  function jogGripper(opened) {
+    runArmJog(async () => {
+      const accepted = await sendArmCommand(
+        'gripper',
+        {opened, duration:0.5},
+        opened ? 'Gripper fully opened.' : 'Gripper closed.'
+      );
+      if (accepted) setServoSliderValue(1, opened ? 2000 : 1500);
+      return accepted;
+    }, 0.5);
+  }
+  document.querySelector('#armYUp').onclick = () => jogAxis('y', 0.5);
+  document.querySelector('#armYDown').onclick = () => jogAxis('y', -0.5);
+  document.querySelector('#armXLeft').onclick = () => jogAxis('x', -0.5);
+  document.querySelector('#armXRight').onclick = () => jogAxis('x', 0.5);
+  document.querySelector('#armZUp').onclick = () => jogAxis('z', 0.5);
+  document.querySelector('#armZDown').onclick = () => jogAxis('z', -0.5);
+  document.querySelector('#armGripClose').onclick = () => jogGripper(false);
+  document.querySelector('#armGripOpen').onclick = () => jogGripper(true);
   function homeArm() {
     document.querySelector('#x').value = 0;
     document.querySelector('#y').value = 6;

@@ -91,9 +91,9 @@ export MASTERPI_CAMERA_DEVICE=/dev/video1
 ```
 
 The **Grab object** quick-arm action immediately closes the gripper at the
-fixed front pickup coordinate and returns the arm to Home while holding the
-object. It intentionally performs no camera, color, stability, or centering
-check; place the object directly in front of the gripper before selecting it.
+fixed ground-level pickup coordinate and returns the arm to Home while holding
+the object. It intentionally performs no camera, color, stability, or centering
+check; place the object at the calibrated ground pickup point before selecting it.
 
 The **Grab can** quick-arm action runs the operator-recorded can pickup profile
 without camera or color checks. It opens the gripper, moves servos 3–6 to
@@ -103,6 +103,13 @@ Stage the can at the calibrated pickup point and keep hands clear.
 The **Check front** quick-arm preset moves servo 3 to `500`, servo 4 to `2500`,
 servo 5 to `810`, and servo 6 to `1500` over 0.8 seconds. It leaves the
 gripper on servo 1 unchanged.
+
+The **Arm position** card includes two four-direction jog pads. On the left,
+up/down changes Y and left/right changes X. On the right, up/down changes Z,
+while left closes the gripper and right fully opens it. Cartesian buttons move
+in 0.5 cm increments using the current X/Y/Z/pitch fields and selected movement
+duration. A rejected coordinate is restored in the form, and the jog controls
+remain disabled until the requested movement time has elapsed.
 
 The chat panel requires the `hermes` command and a configured Hermes model.
 Recorded messages use Hermes' configured speech-to-text provider. On browsers
@@ -236,13 +243,14 @@ slightly if the phrase is missed.
 
 With `--conversation`, each wake opens a persistent direct OpenAI Realtime
 speech-to-speech session and plays **I'm here**. It does not connect to Hermes.
-Speech must remain above RMS 200 for four 80 ms frames before it is accepted;
-recording then ends after three seconds of silence. The captured PCM is
+Speech must remain above RMS 400 for four 80 ms frames before it is accepted;
+recording then ends after three seconds of silence and has a 30-second hard
+limit. The captured PCM is
 resampled from 16 kHz to the Realtime API's 24 kHz PCM format, sent directly to
 `gpt-realtime-2.1`, and returned audio chunks are streamed immediately to
 `aplay` rather than waiting for a complete TTS file. Follow-up turns retain the
-same Realtime conversation without requiring the wake phrase again. Three
-consecutive 15-second silent cycles, 30 user turns, or an exact
+same Realtime conversation without requiring the wake phrase again. Two
+consecutive 8-second silent or empty-transcript cycles, 30 user turns, or an exact
 **stop**, **goodbye**, **never mind**, **cancel**, **stop listening**, **that's
 all**, or **end conversation** returns it to wake-word mode.
 
@@ -257,9 +265,9 @@ controller. The prompt calls physical tools only for explicit action requests
 and does not claim success until the controller result is returned.
 
 Voice actions include state, stop, chassis movement, obstacle avoidance, Home,
-Check front, individual confirmed servos, gripper, unconditional front Grab,
-the bundled Dance with synchronized music, camera analysis, sound
-direction/approach, LEDs, and buzzer. Each tool start,
+Check front, individual confirmed servos, gripper, unconditional ground and
+recorded front-can grabs, the bundled Dance with synchronized music, camera
+analysis, sound direction/approach, LEDs, and buzzer. Each tool start,
 completion/failure, and elapsed time appears as an intermediate step in the
 webpage conversation feed. The direct Grab action has no color-detection
 guardrail; camera analysis is a separate action.
@@ -270,13 +278,24 @@ settling and the vision-model request can exceed 15 seconds.
 
 Barge-in remains disabled in the installed service. While HiBot is thinking or
 speaking, wait for the reply before asking the next question. Normal initial
-speech detection remains local at RMS 200.
+speech detection remains local at RMS 400.
 
 The controller's **Chat with hibot** panel also displays the current spoken
 conversation. It shows OpenAI's input transcript, HiBot's output transcript, an
 animated thinking indicator, and connecting, listening, thinking, streaming,
 and error stages. The page reads the wake service's atomic status snapshot
 through `GET /api/voice/conversation`.
+
+Capture diagnostics persist in the rotating log
+`~/.local/state/masterpi/voice-diagnostics.log`. Each attempt records its RMS
+threshold and distribution, time waiting for speech, captured-audio duration,
+and whether it ended through silence, start timeout, or the hard duration cap.
+Realtime turn latency and empty transcripts are recorded in the same file.
+Inspect recent measurements with:
+
+```bash
+tail -n 100 ~/.local/state/masterpi/voice-diagnostics.log
+```
 
 While Realtime is processing a submitted question, the ReSpeaker runs its
 built-in clockwise spin animation with a low-brightness blue/cyan palette. The
@@ -418,9 +437,13 @@ classes, estimate depth, or drive the chassis. Start with a lightweight block,
 keep the pickup area clear, and tune the fixed coordinate for your camera mount
 and table height before trying fragile objects.
 
-The Hermes/MCP agent `recognize_and_grab` action intentionally bypasses camera
-and color checks. Like the webpage's Quick Arm action, it always executes the
-fixed front pickup and returns Home while holding the object.
+The Hermes/MCP and Realtime agents expose two unconditional grab actions. The
+`grab_from_ground` tool uses the low Cartesian pickup at `(0, 16.5, 0)` cm with
+a safe `-66°` pitch. The
+`grab_from_front` tool executes the operator-recorded servo profile used by the
+webpage's **Grab can** button: servos 3–6 move to `1550`, `1620`, `2500`, and
+`1500`. Neither tool performs a camera or color check, and both return Home
+while holding the object.
 
 The chat understands camera questions such as **“What do you see?”**, **“What
 is in the camera?”**, and **“Describe the scene.”** By default it moves to the

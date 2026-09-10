@@ -136,6 +136,8 @@ class RealtimeVoiceTests(unittest.TestCase):
         self.assertIn("Call a physical-control tool only", HIBOT_TOOL_REALTIME_PROMPT)
         self.assertIn("Never say an action succeeded", HIBOT_TOOL_REALTIME_PROMPT)
         self.assertIn("must not be preceded by a color check", HIBOT_TOOL_REALTIME_PROMPT)
+        self.assertIn("grab_from_ground", HIBOT_TOOL_REALTIME_PROMPT)
+        self.assertIn("grab_from_front", HIBOT_TOOL_REALTIME_PROMPT)
 
     def test_client_executes_function_call_and_returns_output_to_model(self):
         reply_audio = b"\x01\x02"
@@ -372,6 +374,76 @@ class RealtimeVoiceTests(unittest.TestCase):
         self.assertIn("spin", leds)
         self.assertEqual(leds[-1], "off")
         self.assertEqual(directions[:2], ["direction", "off"])
+
+    def test_empty_transcript_counts_toward_silence_limit(self):
+        class Source:
+            def __init__(self):
+                self.starts = 0
+                self.stops = 0
+
+            def start(self):
+                self.starts += 1
+
+            def stop(self):
+                self.stops += 1
+
+        class Recorder:
+            def __init__(self):
+                self.timeouts = []
+                self.results = iter([b"\x00\x00" * 100, None])
+
+            def capture(self, _source, *, start_timeout, on_speech_start=None):
+                self.timeouts.append(start_timeout)
+                return next(self.results)
+
+        class Client:
+            model = "gpt-realtime-2.1"
+            transcription_model = "gpt-4o-mini-transcribe"
+
+            def __init__(self):
+                self.responses = 0
+
+            def connect(self):
+                return 0.1
+
+            def respond(self, _pcm, **_callbacks):
+                self.responses += 1
+                return RealtimeTurnResult("", "", 0.01, None, 0.2, 0.2, 0)
+
+            def close(self):
+                pass
+
+        class Status:
+            def __init__(self):
+                self.calls = []
+
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: self.calls.append((name, args, kwargs))
+
+        source = Source()
+        recorder = Recorder()
+        client = Client()
+        status = Status()
+        conversation = RealtimeVoiceConversation(
+            source,
+            recorder,
+            client,
+            initial_timeout=15,
+            followup_timeout=8,
+            max_silent_cycles=2,
+            status=status,
+            settle_seconds=0,
+        )
+
+        conversation.run()
+
+        self.assertEqual(recorder.timeouts, [15, 8])
+        self.assertEqual(client.responses, 1)
+        step_text = [args[1] for name, args, _kwargs in status.calls if name == "step"]
+        self.assertIn("No words recognized (1/2).", step_text)
+        self.assertIn("No speech heard (2/2).", step_text)
+        self.assertEqual(source.starts, 2)
+        self.assertGreaterEqual(source.stops, 2)
 
 
 if __name__ == "__main__":
