@@ -22,6 +22,7 @@ from smbus2 import SMBus
 WONDERECHO_ADDRESS = 0x34
 WONDERECHO_RESULT_REGISTER = 0x64
 WONDERECHO_SPEAK_REGISTER = 0x6E
+REPOSITORY_VENDOR_ROOT = Path(__file__).resolve().parents[3] / "MasterPi_original"
 
 
 class BackendUnavailable(RuntimeError):
@@ -109,7 +110,15 @@ def _configure_vendor_data_paths() -> None:
         return
     configured = os.environ.get("MASTERPI_CONFIG_ROOT")
     roots = [Path(configured)] if configured else []
-    roots.extend((Path("/home/pi/MasterPi"), Path.home() / "projs" / "MasterPi"))
+    roots.extend(
+        (
+            REPOSITORY_VENDOR_ROOT,
+            Path("/home/pi/MasterPi_original"),
+            Path.home() / "projs" / "MasterPi_original",
+            Path("/home/pi/MasterPi"),
+            Path.home() / "projs" / "MasterPi",
+        )
+    )
     for root in roots:
         deviation = root / "Deviation.yaml"
         if deviation.is_file():
@@ -284,6 +293,9 @@ class VendorBackend:
         roots = [Path(configured)] if configured else []
         roots.extend(
             (
+                REPOSITORY_VENDOR_ROOT,
+                Path("/home/pi/MasterPi_original"),
+                Path.home() / "projs" / "MasterPi_original",
                 Path("/home/pi/MasterPi"),
                 Path("/home/pi/TurboPi"),
                 Path.home() / "projs" / "MasterPi",

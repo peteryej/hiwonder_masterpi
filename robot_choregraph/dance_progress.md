@@ -45,9 +45,10 @@
 - Inspected 80 frames at quarter-second intervals across the full clip, plus
   overview contact sheets, to identify arm gestures, gripper pulses, chassis
   turns, and forward/backward phrases. Timing is a manual visual transcription.
-- Read `../hiwonder_masterpi/MasterPi/src/masterpi_control/{robot,server,backends}.py`
+- Read `../hiwonder_masterpi/MasterPi_original/` while tracing the original
+  vendor SDK and hardware behavior.
   and the vendor servo/kinematics demos. The root README refers to an older
-  `masterpi/` layout; the actual controller is under `MasterPi/`.
+  `masterpi/` layout; the original vendor SDK is under `MasterPi_original/`.
 - Selected the existing HTTP API (`/api/drive`, `/api/stop`, `/api/arm`,
   `/api/gripper`, `/api/home`). Coordinates are cm; API durations are seconds.
   Chassis headings: right 0°, forward 90°, left 180°, backward 270°;
@@ -115,7 +116,7 @@ For your later hardware test, start the existing controller on the Raspberry Pi
 using its already-configured environment:
 
 ```bash
-cd /path/to/hiwonder_masterpi/MasterPi
+cd /path/to/hiwonder_masterpi/MasterPi_original
 .venv/bin/masterpi serve
 ```
 

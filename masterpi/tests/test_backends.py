@@ -1,8 +1,13 @@
 import unittest
 import queue
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from masterpi_control.backends import VendorBackend, _BoardMecanumChassis
+from masterpi_control.backends import (
+    REPOSITORY_VENDOR_ROOT,
+    VendorBackend,
+    _BoardMecanumChassis,
+)
 
 
 class FakeChassis:
@@ -124,6 +129,10 @@ def backend(board, modern=True):
 
 
 class VendorBackendMappingTests(unittest.TestCase):
+    def test_repository_vendor_root_uses_renamed_original_directory(self):
+        repository = Path(__file__).resolve().parents[2]
+        self.assertEqual(REPOSITORY_VENDOR_ROOT, repository / "MasterPi_original")
+
     def test_modern_board_is_injected_into_arm_runtime(self):
         with (
             patch.object(VendorBackend, "_add_vendor_paths"),

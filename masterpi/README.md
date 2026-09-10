@@ -52,18 +52,20 @@ The installation pulls in the small set of modules required by Hiwonder's SDK:
 PySerial, NumPy, and PyYAML.
 
 The last command should report the detected chassis, board, and arm modules. If
-the Hiwonder software is somewhere other than `/home/pi/MasterPi` or
-`/home/pi/TurboPi`, set its root explicitly:
+the Hiwonder software is somewhere other than this repository's
+`MasterPi_original/`, `/home/pi/MasterPi`, or `/home/pi/TurboPi`, set its root
+explicitly:
 
 ```bash
-export MASTERPI_VENDOR_ROOT=/path/to/MasterPi
+export MASTERPI_VENDOR_ROOT=/path/to/MasterPi_original
 .venv/bin/masterpi diagnose
 ```
 
-The repository layout `MasterPi/masterpi_sdk/{common_sdk,kinematics_sdk}` is
-detected automatically. Set `MASTERPI_SERIAL_DEVICE` only when the controller
-UART is not exposed as `/dev/serial0` or `/dev/ttyAMA0`. Calibration YAML files
-are also discovered in the repository; an unusual location can be supplied as
+The repository layout
+`MasterPi_original/masterpi_sdk/{common_sdk,kinematics_sdk}` is detected
+automatically. Set `MASTERPI_SERIAL_DEVICE` only when the controller UART is
+not exposed as `/dev/serial0` or `/dev/ttyAMA0`. Calibration YAML files are also
+discovered in the repository; an unusual location can be supplied as
 `MASTERPI_CONFIG_ROOT`.
 
 Do not install replacement GPIO/serial drivers from PyPI. The hardware modules

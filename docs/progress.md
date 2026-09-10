@@ -2,6 +2,22 @@
 
 2026-09-09
 
+## Original vendor directory rename
+
+- Renamed the bundled Hiwonder vendor tree from `MasterPi/` to
+  `MasterPi_original/` so its role is distinct from the custom `masterpi/`
+  controller.
+- Updated controller SDK/config discovery, service configuration, editable SDK
+  installation paths, documentation, and the offline dance IK check to use the
+  new directory while retaining compatibility with standard Hiwonder
+  `/home/pi/MasterPi` and `/home/pi/TurboPi` installations.
+- Verification passes all 142 controller tests and all 18 choreography tests,
+  including the real offline vendor-IK check. The restarted live controller
+  reports the Hiwonder board, four-wheel mixer, arm IK, sonar, voice module,
+  serial device, and buttons with no error; its webpage and state API return
+  HTTP 200. The controller, wake-word listener, and Hermes gateway remain
+  active, and no motion action was invoked.
+
 ## Arm-position directional controls
 
 - Added two four-direction jog pads to the webpage's **Arm position** card. The

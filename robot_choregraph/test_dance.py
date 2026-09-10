@@ -262,7 +262,7 @@ class DanceTests(unittest.TestCase):
                 controller.post("arm", {})
 
     def test_vendor_ik_and_calibrated_servo_limits(self):
-        root = Path(__file__).resolve().parent.parent / "hiwonder_masterpi" / "MasterPi"
+        root = Path(__file__).resolve().parent.parent / "MasterPi_original"
         kinematics = root / "masterpi_sdk/kinematics_sdk/kinematics"
         if not kinematics.is_dir():
             self.skipTest("Neighboring vendor source is required for this offline IK check")

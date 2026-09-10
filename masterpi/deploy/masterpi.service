@@ -1,0 +1,20 @@
+[Unit]
+Description=Hiwonder MasterPi web controller
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/projs/hiwonder_masterpi/masterpi
+Environment=PATH=/home/pi/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MASTERPI_VENDOR_ROOT=/home/pi/projs/hiwonder_masterpi/MasterPi_original
+Environment=PYTHONUNBUFFERED=1
+Environment=MASTERPI_HERMES_API_URL=http://127.0.0.1:8642
+ExecStart=/home/pi/projs/hiwonder_masterpi/masterpi/.venv/bin/masterpi serve --host 0.0.0.0 --port 8000 --tls-port 8443 --certfile /home/pi/.config/masterpi/tls/server.crt --keyfile /home/pi/.config/masterpi/tls/server.key --ca-certfile /home/pi/.config/masterpi/tls/ca.crt
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

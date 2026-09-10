@@ -6,9 +6,10 @@ SDK.
 
 ## Folder overview
 
-### `MasterPi/` — Hiwonder software and hardware SDK
+### `MasterPi_original/` — original Hiwonder software and hardware SDK
 
-[`MasterPi/`](MasterPi/) contains the robot software supplied by Hiwonder. It
+[`MasterPi_original/`](MasterPi_original/) contains the unmodified robot
+software supplied by Hiwonder. It
 includes:
 
 - Expansion-board, mecanum chassis, ultrasonic sensor, and RGB hardware drivers
@@ -24,9 +25,9 @@ move the wheels or arm when started.
 Example vendor demos:
 
 ```bash
-python MasterPi/board_demo/hardware_test.py
-python MasterPi/board_demo/control_by_servo.py
-python MasterPi/board_demo/control_by_kinematics.py
+python MasterPi_original/board_demo/hardware_test.py
+python MasterPi_original/board_demo/control_by_servo.py
+python MasterPi_original/board_demo/control_by_kinematics.py
 ```
 
 Keep the robot supported, keep clear of the arm, and have the power switch
@@ -45,9 +46,9 @@ within reach before running hardware demonstrations.
 - A validated JSON HTTP API
 - A mock backend and hardware-free automated tests
 
-It imports the hardware drivers and kinematics implementation from `MasterPi/`
-while adding validation, concurrency control, safe stop behavior, and the web
-interface.
+It imports the hardware drivers and kinematics implementation from
+`MasterPi_original/` while adding validation, concurrency control, safe stop
+behavior, and the web interface.
 
 ## Setup
 
@@ -58,8 +59,8 @@ controller and bundled SDK packages:
 cd masterpi
 python3 -m venv .venv
 .venv/bin/pip install -e .
-.venv/bin/pip install -e ../MasterPi/masterpi_sdk/common_sdk
-.venv/bin/pip install -e ../MasterPi/masterpi_sdk/kinematics_sdk
+.venv/bin/pip install -e ../MasterPi_original/masterpi_sdk/common_sdk
+.venv/bin/pip install -e ../MasterPi_original/masterpi_sdk/kinematics_sdk
 ```
 
 Enable Raspberry Pi I²C for the ultrasonic sensor:
@@ -89,4 +90,3 @@ masterpi --mock serve --host 127.0.0.1
 
 See [`masterpi/README.md`](masterpi/README.md) for the full CLI and HTTP API
 reference, configuration options, and safety notes.
-
