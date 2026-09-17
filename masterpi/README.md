@@ -505,7 +505,15 @@ classes, estimate depth, or drive the chassis. Start with a lightweight block,
 keep the pickup area clear, and tune the fixed coordinate for your camera mount
 and table height before trying fragile objects.
 
-The Hermes/MCP and Realtime agents expose two unconditional grab actions. The
+The Hermes/MCP and Realtime agents expose `grab_object`, the guarded ground
+grab: it runs the full `hibot-ground-grab` procedure (Check ground, the Check
+front stage and approach when needed, bounded centring, pickup, camera
+confirmation) and takes an optional `target` in the operator's own words plus an
+optional `pickup_z`. It is the action to use for any request to grab or pick up
+a named object, it can take up to a minute (300 s client timeout), and it makes
+one attempt.
+
+They also expose two unconditional grab actions. The
 `grab_from_ground` tool uses the operator's Check ground image-center pickup
 at `(2, 13, -1)` cm with a `-68°` pitch preference (offline IK checked including
 servo calibration offsets) and starts from the arm's current pose. The

@@ -135,7 +135,10 @@ class RealtimeVoiceTests(unittest.TestCase):
     def test_tool_prompt_requires_explicit_action_and_confirmed_result(self):
         self.assertIn("Call a physical-control tool only", HIBOT_TOOL_REALTIME_PROMPT)
         self.assertIn("Never say an action succeeded", HIBOT_TOOL_REALTIME_PROMPT)
-        self.assertIn("must not be preceded by a color check", HIBOT_TOOL_REALTIME_PROMPT)
+        # Voice must reach for the guarded grab, not the blind quick actions.
+        self.assertIn("always use grab_object", HIBOT_TOOL_REALTIME_PROMPT)
+        self.assertIn("blind fixed-pose quick actions", HIBOT_TOOL_REALTIME_PROMPT)
+        self.assertIn("ask before trying again", HIBOT_TOOL_REALTIME_PROMPT)
         self.assertIn("grab_from_ground", HIBOT_TOOL_REALTIME_PROMPT)
         self.assertIn("grab_from_front", HIBOT_TOOL_REALTIME_PROMPT)
 

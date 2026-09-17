@@ -55,6 +55,15 @@ class HibotMcpTests(unittest.TestCase):
             "drive_for", {"direction": "forward", "speed": 40.0, "duration": 1.0}
         )
 
+    def test_grab_object_sends_the_guarded_flow_with_only_given_arguments(self):
+        with patch.object(hibot_mcp, "dispatch_robot_tool") as call:
+            call.return_value = {"grabbed": True}
+            hibot_mcp.grab_object("the toy")
+            self.assertEqual(call.call_args[0][1], "grab_object")
+            self.assertEqual(call.call_args[0][2], {"target": "the toy"})
+            hibot_mcp.grab_object(pickup_z=-2)
+            self.assertEqual(call.call_args[0][2], {"pickup_z": -2})
+
     def test_move_and_rotate_send_only_the_supplied_amount(self):
         with patch.object(hibot_mcp, "dispatch_robot_tool") as call:
             call.return_value = {"duration": 0.5}

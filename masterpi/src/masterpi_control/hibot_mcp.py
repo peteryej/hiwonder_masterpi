@@ -80,6 +80,28 @@ def set_gripper(opened: bool, duration: float = 0.5) -> dict[str, Any]:
 
 
 @mcp.tool()
+def grab_object(target: str | None = None, pickup_z: float | None = None) -> dict[str, Any]:
+    """Find an object on the floor, centre on it, pick it up, and verify.
+
+    The guarded ground grab, and the only action that actually looks for the
+    object: Check ground, the Check front stage and approach when the ground
+    view is empty, bounded chassis centring, pickup at (2, 13, -1) cm, lift
+    while holding, then two spaced confirmation frames. Use it for any request
+    to grab, pick up, or fetch a named object.
+
+    target: the operator's words for the object ("the toy", "orange can");
+    omit to take the one graspable object in view. pickup_z lowers the pickup
+    for a flat or soft target (-2 is the usual retry). Runs up to a minute and
+    makes ONE attempt; a failed grasp is reported and must not be retried
+    without the operator asking.
+    """
+    arguments = {"target": target, "pickup_z": pickup_z}
+    return dispatch_robot_tool(
+        client, "grab_object", {k: v for k, v in arguments.items() if v is not None}
+    )
+
+
+@mcp.tool()
 def grab_from_ground() -> dict[str, Any]:
     """Blind fixed-point pickup at (2, 13, -1) cm, then Home. Finds nothing.
 

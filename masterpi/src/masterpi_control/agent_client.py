@@ -17,6 +17,9 @@ DEFAULT_SLOW_ACTION_TIMEOUTS = {
     # Check-front positioning plus a remote vision model can legitimately take
     # much longer than a normal motor or sensor command.
     "camera_analyze": 180.0,
+    # The guarded grab is several of those analyses plus chassis and arm
+    # motion: a normal timeout would abandon a run already moving the robot.
+    "grab_object": 300.0,
 }
 
 

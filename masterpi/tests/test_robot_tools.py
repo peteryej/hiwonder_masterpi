@@ -25,6 +25,13 @@ class RobotToolDispatcherTests(unittest.TestCase):
         self.assertIn("check_ground", by_name)
         self.assertIn("gripper servo 1=2200", by_name["check_ground"]["description"])
         self.assertIn("dance", by_name)
+        self.assertIn("grab_object", by_name)
+        self.assertEqual(
+            sorted(by_name["grab_object"]["parameters"]["properties"]),
+            ["pickup_z", "target"],
+        )
+        self.assertEqual(by_name["grab_object"]["parameters"]["required"], [])
+        self.assertIn("only action that actually finds", by_name["grab_object"]["description"])
         self.assertIn("grab_from_ground", by_name)
         self.assertIn("x=2, y=13, z=-1 cm", by_name["grab_from_ground"]["description"])
         self.assertIn("grab_from_front", by_name)

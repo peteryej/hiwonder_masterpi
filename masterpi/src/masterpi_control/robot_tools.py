@@ -128,6 +128,17 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
         ),
     ),
     RobotToolDefinition(
+        "grab_object",
+        "Pick up an object from the floor, the guarded way: move to Check ground, find the object with the camera, drive the chassis in small bounded steps until it is centred, pick up at (2, 13, -1) cm, lift while holding, and confirm from two spaced camera frames. Use this for any request to grab, pick up, or fetch a named object - it is the only action that actually finds the object. Pass target as the operator's words for it ('the toy', 'orange can'); omit it to take the one graspable object in view. Takes up to a minute and makes one attempt: a failed grasp is reported, never retried without a new request.",
+        "grab_object",
+        _object_schema(
+            {
+                "target": {"type": "string", "maxLength": 60},
+                "pickup_z": {"type": "number", "minimum": -3, "maximum": 2},
+            },
+        ),
+    ),
+    RobotToolDefinition(
         "grab_from_ground",
         "Blind fixed-point pickup: close the gripper at the Check ground image-center coordinate (x=2, y=13, z=-1 cm), starting from the arm's current pose, and return Home. It does not look for, center on, or verify an object, so use it only when the object is already staged at that point or the quick action is asked for by name. To grab a named object off the floor, follow the hibot-ground-grab skill instead.",
         "grab_from_ground",

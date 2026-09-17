@@ -2,6 +2,28 @@
 
 2026-09-16
 
+## Voice and MCP can run the guided grab
+
+- Voice had no guarded grab at all: the shared tool set offered only the two
+  blind poses, so "grab the toy" could only reach `grab_from_ground`, which
+  looks for nothing. Added `grab_object` to `ROBOT_TOOL_DEFINITIONS` (target and
+  pickup_z, both optional), routed to the existing `/api/agent/grab_object`, so
+  voice and MCP get the same guarded flow the webpage button runs.
+- `agent_client` gives it a 300 s timeout alongside `camera_analyze`'s 180 s: it
+  is several vision calls plus chassis and arm motion, and a 15 s default would
+  abandon a run already moving the robot.
+- The realtime prompt now says to always use `grab_object` for grab/pick
+  up/fetch, pass the user's own words as the target, say it is starting first
+  because the run takes up to a minute, report what it found and whether the
+  hold was confirmed, and ask before a second attempt. `grab_from_ground` and
+  `grab_from_front` are described as blind fixed-pose quick actions to use only
+  when asked for by name.
+- Added the MCP wrapper with the same guidance, so Hermes gets a one-call path
+  to the procedure instead of only the step-by-step skill.
+- Tests 185 to 186. Restarted masterpi, masterpi-wake-word (voice picks up the
+  new prompt and tool list at session start) and hermes-gateway; MCP now
+  exposes 23 tools including grab_object.
+
 ## Guided grab now runs the Check front stage too
 
 - The server-side `grab_object` only implemented the skill's ground phase, so
