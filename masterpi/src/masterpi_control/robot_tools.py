@@ -88,8 +88,16 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
     ),
     RobotToolDefinition(
         "check_front",
-        "Move the camera arm to the check-front pose: servos 3=500, 4=2500, 5=1350, 6=1500.",
+        "Move to check-front, matching check-ground except servo 3=1200: servos 4=2500, 5=1500, 6=1500, and gripper servo 1=2200.",
         "check_front",
+        _object_schema(
+            {"duration": {**_DURATION, "default": 0.8}},
+        ),
+    ),
+    RobotToolDefinition(
+        "check_ground",
+        "Move the camera arm to the recorded check-ground pose: servos 3=500, 4=2500, 5=1500, 6=1500, and gripper servo 1=2200.",
+        "check_ground",
         _object_schema(
             {"duration": {**_DURATION, "default": 0.8}},
         ),
@@ -109,7 +117,7 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
     ),
     RobotToolDefinition(
         "set_gripper",
-        "Open or close HiBot's gripper using its validated presets.",
+        "Open HiBot's gripper with servo 1=2500 or close it with servo 1=500.",
         "gripper",
         _object_schema(
             {
@@ -121,13 +129,13 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
     ),
     RobotToolDefinition(
         "grab_from_ground",
-        "Unconditionally pick up an object from HiBot's fixed ground-level coordinate and return the arm Home while holding it.",
+        "Blind fixed-point pickup: close the gripper at the Check ground image-center coordinate (x=2, y=13, z=-1 cm), starting from the arm's current pose, and return Home. It does not look for, center on, or verify an object, so use it only when the object is already staged at that point or the quick action is asked for by name. To grab a named object off the floor, follow the hibot-ground-grab skill instead.",
         "grab_from_ground",
         _object_schema(),
     ),
     RobotToolDefinition(
         "grab_from_front",
-        "Unconditionally run the recorded front can-pickup servo pose used by the webpage's Grab can quick action, then return the arm Home while holding it.",
+        "Blind recorded can pickup: run the operator-recorded can servo pose, then return Home. Its webpage button has been removed, so this tool is its only caller. It performs no camera, color, or centering check; to grab a named object off the floor, follow the hibot-ground-grab skill instead.",
         "grab_from_front",
         _object_schema(),
     ),
@@ -149,7 +157,7 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
     ),
     RobotToolDefinition(
         "drive_for",
-        "Drive using the webpage's four-wheel chassis mapping, then stop. Duration is capped at 8 seconds.",
+        "Drive using the webpage's corrected four-wheel chassis mapping (left heading 0, right 180, forward 90, backward 270), then stop. Duration is capped at 8 seconds.",
         "drive_for",
         _object_schema(
             {
@@ -165,6 +173,37 @@ ROBOT_TOOL_DEFINITIONS: tuple[RobotToolDefinition, ...] = (
                     ],
                 },
                 "duration": {"type": "number", "minimum": 0.05, "maximum": 8, "default": 1},
+                "speed": {"type": "number", "minimum": 40, "maximum": 100, "default": 40},
+            },
+            ["direction"],
+        ),
+    ),
+    RobotToolDefinition(
+        "move",
+        "Drive HiBot straight or sideways one bounded move, given either a distance in centimetres or a duration in seconds (exactly one). Distance uses the operator calibration at speed 40 - about 40 cm/s forward or backward and 20 cm/s strafing - so it is a timed estimate, not odometry: 2-320 cm forward/backward, 1-160 cm left/right. Pass seconds instead to use another speed.",
+        "move",
+        _object_schema(
+            {
+                "direction": {
+                    "type": "string",
+                    "enum": ["forward", "backward", "left", "right"],
+                },
+                "distance_cm": {"type": "number", "minimum": 1, "maximum": 320},
+                "seconds": {"type": "number", "minimum": 0.05, "maximum": 8},
+                "speed": {"type": "number", "minimum": 40, "maximum": 100, "default": 40},
+            },
+            ["direction"],
+        ),
+    ),
+    RobotToolDefinition(
+        "rotate",
+        "Rotate HiBot in place with no translation, given either an angle in degrees or a duration in seconds (exactly one). Degrees use the operator calibration of 190 degrees/s, so it is a timed estimate with no gyro or odometry behind it; 9.5-1520 degrees per bounded move.",
+        "rotate",
+        _object_schema(
+            {
+                "direction": {"type": "string", "enum": ["left", "right"]},
+                "degrees": {"type": "number", "minimum": 9.5, "maximum": 1520},
+                "seconds": {"type": "number", "minimum": 0.05, "maximum": 8},
                 "speed": {"type": "number", "minimum": 40, "maximum": 100, "default": 40},
             },
             ["direction"],

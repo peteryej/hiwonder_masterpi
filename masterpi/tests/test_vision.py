@@ -8,6 +8,7 @@ from masterpi_control.backends import MockBackend
 from masterpi_control.robot import Robot, ValidationError
 from masterpi_control.vision import (
     VisionGrasper,
+    select_ground_target,
     annotate_object_detections,
     recognize_colored_object,
     recognize_colored_objects,
@@ -28,6 +29,20 @@ def colored_jpeg(color=(0, 0, 255), center=(320, 240)):
     return encoded.tobytes()
 
 
+def hermes_objects(center=(0.5, 0.5), size=0.4, label="stuffed toy"):
+    half = size / 2
+    return {
+        "description": f"a {label} on the floor",
+        "objects": [
+            {"label": "wooden floor", "confidence": 0.98,
+             "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}},
+            {"label": label, "confidence": 0.93,
+             "bbox": {"x_min": center[0] - half, "y_min": center[1] - half,
+                      "x_max": center[0] + half, "y_max": center[1] + half}},
+        ],
+    }
+
+
 class FakeCamera:
     def __init__(self, frames):
         self.frames = list(frames)
@@ -37,6 +52,104 @@ class FakeCamera:
         frame = self.frames[min(self.index, len(self.frames) - 1)]
         self.index += 1
         return self.index, frame
+
+
+class GuidedGrabTests(unittest.TestCase):
+    """The Grab object action: look, centre, pick up, confirm from the camera."""
+
+    def setUp(self):
+        self.robot = Robot(MockBackend())
+        self.addCleanup(self.robot.close)
+        self.frames = [b"\xff\xd8ground", b"\xff\xd8lift-1", b"\xff\xd8lift-2"]
+        self.camera = FakeCamera(self.frames)
+        self.grasper = VisionGrasper(self.robot, self.camera)
+
+    def run_grab(self, analyses, **kwargs):
+        calls = []
+
+        def analyze(frame):
+            calls.append(frame)
+            return analyses[min(len(calls) - 1, len(analyses) - 1)]
+
+        with patch("masterpi_control.vision.time.sleep"):
+            result = self.grasper.grab_object(analyze, **kwargs)
+        return result, calls
+
+    def test_centred_object_is_picked_up_and_confirmed_from_the_near_field(self):
+        held = {"description": "toy filling the view", "objects": [
+            {"label": "stuffed toy", "confidence": 0.9,
+             "bbox": {"x_min": 0.02, "y_min": 0.02, "x_max": 0.95, "y_max": 0.95}}]}
+        self.camera.frames = [b"\xff\xd8a", b"\xff\xd8b", b"\xff\xd8c"]
+        result, _ = self.run_grab([hermes_objects(), held])
+        self.assertTrue(result["grabbed"])
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(result["target"], "stuffed toy")
+        self.assertEqual(result["corrections"], [])
+        self.assertEqual(result["pickup"], {"x": 2.0, "y": 13.0, "z": -1.0, "units": "cm"})
+        self.assertEqual(result["finished_at"], "lift pose, still holding")
+        arm_events = [e for e in self.robot.backend.events if e["action"] == "arm"]
+        self.assertEqual(
+            [(e["x"], e["y"], e["z"]) for e in arm_events],
+            [(2, 13, 8), (2, 13, -1), (0, 15, 20)],
+        )
+
+    def test_offset_object_is_centred_with_bounded_chassis_steps(self):
+        # Right of centre by ~1.8 cm, then centred on the next look.
+        result, _ = self.run_grab(
+            [hermes_objects(center=(0.64, 0.5)), hermes_objects(), hermes_objects()]
+        )
+        self.assertEqual(len(result["corrections"]), 1)
+        correction = result["corrections"][0]
+        self.assertEqual(correction["direction"], "right")
+        self.assertGreaterEqual(correction["distance_cm"], 1.0)
+        self.assertLessEqual(correction["distance_cm"], 4.0)
+
+    def test_clipped_box_drives_forward_instead_of_trusting_its_centre(self):
+        clipped = {"description": "part of a toy", "objects": [
+            {"label": "stuffed toy", "confidence": 0.9,
+             "bbox": {"x_min": 0.3, "y_min": 0.0, "x_max": 0.7, "y_max": 0.38}}]}
+        result, _ = self.run_grab([clipped])
+        self.assertEqual(result["grabbed"], False)
+        self.assertEqual([c["direction"] for c in result["corrections"]], ["forward"] * 6)
+        self.assertIn("could not centre", result["reason"])
+
+    def test_missing_object_reports_instead_of_moving_the_arm(self):
+        floor_only = {"description": "just the floor", "objects": [
+            {"label": "wooden floor", "confidence": 0.98,
+             "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}}]}
+        result, _ = self.run_grab([floor_only])
+        self.assertFalse(result["grabbed"])
+        self.assertIn("no object found", result["reason"])
+        self.assertEqual([e for e in self.robot.backend.events if e["action"] == "arm"], [])
+
+    def test_identical_confirmation_frames_are_never_read_as_a_hold(self):
+        self.camera.frames = [b"\xff\xd8ground", b"\xff\xd8same", b"\xff\xd8same"]
+        result, _ = self.run_grab([hermes_objects()])
+        self.assertFalse(result["grabbed"])
+        self.assertIsNone(result["confirmed"])
+        self.assertIn("stuck", result["confirmation"]["reason"])
+
+    def test_empty_near_field_after_the_lift_reports_a_miss(self):
+        far = {"description": "the room", "objects": [
+            {"label": "chair", "confidence": 0.8,
+             "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 0.2, "y_max": 0.3}}]}
+        self.camera.frames = [b"\xff\xd8a", b"\xff\xd8b", b"\xff\xd8c"]
+        result, _ = self.run_grab([hermes_objects(), far])
+        self.assertFalse(result["grabbed"])
+        self.assertFalse(result["confirmed"])
+        self.assertIn("near field", result["confirmation"]["reason"])
+
+    def test_retry_depth_is_bounded(self):
+        with self.assertRaisesRegex(ValidationError, "pickup_z"):
+            self.grasper.grab_object(lambda frame: hermes_objects(), pickup_z=-5)
+
+    def test_named_target_beats_the_largest_object(self):
+        analysis = hermes_objects()
+        analysis["objects"].append({
+            "label": "red boot", "confidence": 0.8,
+            "bbox": {"x_min": 0.45, "y_min": 0.45, "x_max": 0.6, "y_max": 0.6}})
+        self.assertEqual(select_ground_target(analysis["objects"], "boot")["label"], "red boot")
+        self.assertEqual(select_ground_target(analysis["objects"])["label"], "stuffed toy")
 
 
 class VisionTests(unittest.TestCase):
@@ -98,11 +211,13 @@ class VisionTests(unittest.TestCase):
         arm_events = [event for event in robot.backend.events if event["action"] == "arm"]
         self.assertEqual(
             [(event["x"], event["y"], event["z"]) for event in arm_events],
-            [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 0), (0, 6, 18)],
+            [(2, 13, 8), (2, 13, -1), (0, 6, 18)],
         )
-        self.assertEqual(arm_events[2]["pitch"], -66)
+        self.assertEqual(arm_events[1]["pitch"], -68)
+        self.assertEqual((arm_events[1]["pitch_min"], arm_events[1]["pitch_max"]), (-90, -68))
         servo_events = [event for event in robot.backend.events if event["action"] == "servo"]
-        self.assertEqual([event["pulse"] for event in servo_events], [2000, 1500])
+        self.assertEqual([event["pulse"] for event in servo_events], [2500, 500])
+        self.assertEqual(result["pickup"], {"x": 2.0, "y": 13.0, "z": -1.0, "units": "cm"})
 
     def test_unconditional_front_grab_skips_camera_and_returns_home(self):
         robot = Robot(MockBackend())
@@ -117,9 +232,10 @@ class VisionTests(unittest.TestCase):
         arm_events = [event for event in robot.backend.events if event["action"] == "arm"]
         self.assertEqual(
             [(event["x"], event["y"], event["z"]) for event in arm_events],
-            [(0, 6, 18), (0, 16.5, 8), (0, 16.5, 0), (0, 6, 18)],
+            [(2, 13, 8), (2, 13, -1), (0, 6, 18)],
         )
-        self.assertEqual(arm_events[2]["pitch"], -66)
+        self.assertEqual(arm_events[1]["pitch"], -68)
+        self.assertEqual(result["pickup"], {"x": 2.0, "y": 13.0, "z": -1.0, "units": "cm"})
 
     def test_centered_can_uses_recorded_direct_servo_pickup_pose(self):
         robot = Robot(MockBackend())
@@ -132,7 +248,7 @@ class VisionTests(unittest.TestCase):
         servo_events = [event for event in robot.backend.events if event["action"] == "servo"]
         self.assertEqual(
             [(event["servo_id"], event["pulse"]) for event in servo_events],
-            [(1, 2000), (3, 1550), (4, 1620), (5, 2500), (6, 1500), (1, 1500)],
+            [(1, 2500), (3, 1550), (4, 1620), (5, 2500), (6, 1500), (1, 500)],
         )
         arm_events = [event for event in robot.backend.events if event["action"] == "arm"]
         self.assertEqual(

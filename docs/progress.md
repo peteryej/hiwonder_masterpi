@@ -1,5 +1,537 @@
 # MasterPi progress
 
+2026-09-16
+
+## New chat button
+
+- The web chat continues one long-lived Hermes session (`--continue
+  hibot-web-safe`), so stale context kept steering replies - the obstacle
+  refusal survived in that conversation even after the files behind it were
+  fixed. Added a **New chat** button in the chat panel header: it posts to
+  `/api/chat/new`, which calls the existing `HermesChat.new_session()` to switch
+  to a fresh uuid-suffixed session, then clears the on-screen log and confirms
+  the change. Voice is untouched; it already opens a session per wake word.
+- Tests 176 to 177: the endpoint returns a new session each call, and the page
+  carries the button and its handler. Verified live: two clicks returned
+  distinct sessions (`hibot-web-safe-0e7bec68...`, `...-dd9a2b37...`) and a
+  chat message on the fresh session answered normally.
+
+## Web chat can actually move the robot
+
+- Root cause of the web chat's "I can't safely strafe left": the chat path had
+  no movement action at all. `chat_action_name` recognised only `nod` and
+  `shake`, so "move left 10 cm" went to Hermes as plain text with no robot
+  tools attached, and the model wrote a refusal, reaching for the camera
+  context in its session to justify it. Reproduced directly: the same CLI
+  invocation the web chat uses answers "the robot-control interface isn't
+  available in this session" - the MCP tools belong to the gateway, not to
+  `hermes chat --toolsets safe`.
+- Added `chat_motion_request` + `run_chat_motion` to the chat path: an
+  explicitly named move or rotation is parsed (direction, plus cm, degrees, or
+  seconds) and executed through `robot.move`/`robot.rotate` before the message
+  ever reaches the model. No camera check, no refusal path. The reply states
+  what was done, the converted duration, and that it is a timed estimate rather
+  than odometry. A bare "move left" uses a stated default (10 cm, 45 degrees)
+  instead of asking. Negations ("do not move left") and ordinary questions
+  still go to Hermes untouched.
+- Also fixed the two places that taught the agent to gate movement on
+  perception: `~/.hermes/SOUL.md`, whose Safety section said "Check relevant
+  sensor or camera context before movement", is now an Acting section saying an
+  explicitly commanded bounded action runs immediately and is never declined
+  over what an image seems to show; sensor checks are for motion the agent
+  chose itself. In `~/.hermes/memories/MEMORY.md`, the "physical actions
+  require safety care" line was rewritten the same way, and the stale memory
+  claiming `drive_for` only turns one wheel was replaced with the corrected
+  mapping and a pointer to `move`/`rotate`.
+- Tests 172 to 176. Verified live: "move left 10 cm" -> "Moved left 10 cm
+  (0.5 s at speed 40)", "turn right 90 degrees" -> "Rotated right 90 degrees
+  (0.474 s at 190 degrees/s)", and "do not move left" still just replies.
+
+## Explicit movement commands are no longer perception-gated
+
+- Asked to "move left 10 cm", the Hermes agent replied that it did not move
+  because the camera showed a chair leg and a person nearby, and asked the
+  operator to clear the left side. The source was `robot-physical-control`
+  item 2 ("Before chassis motion, obtain fresh sensor/state information ...
+  Treat any detected obstacle as real") plus the navigation bullet telling it
+  to ask the operator to clear the rear before backing up.
+- The skill now opens with "Explicit commands execute as given": when the
+  operator names the action and its values, run it immediately - no camera
+  frame first, no weighing of the last frame, no asking to clear the area. The
+  stated reason is that the operator can see the robot and its surroundings
+  while the agent has one stale low-angle frame, so refusing on that basis
+  withholds a movement the operator can see is safe. It also forbids
+  substituting a smaller distance, another direction, or obstacle avoidance,
+  and allows noting what it saw afterwards as an observation, never as a
+  precondition.
+- Item 2 now applies only to open-ended motion the agent chose itself
+  (approaching a sound, exploring, crossing a room). Refusals are reserved for
+  real blockers: a controller rejection, an actuator failure mid-motion, an
+  unbounded request, or a stop instruction. The rearward-sensor bullet now says
+  to keep the move bounded and note it was not sensor-validated, rather than
+  withhold it. The reporting section adds that "the camera shows something
+  nearby" is not a blocker for a commanded bounded move.
+- The autonomous approach inside `hibot-ground-grab` keeps its own clearance
+  rule: that motion is the agent's choice, not an operator command. Installed
+  copy synced; skills are read per session, so no gateway restart.
+
+## Grab object streams its steps into the chat panel
+
+- A guided grab moves the robot for tens of seconds. Returning one verdict at
+  the end hid what it saw and why it moved, so `grab_object` now takes an
+  `on_event` callback and emits a step at each stage: the Check ground look
+  (with the annotated frame), every observation as "saw <label> at +x cm
+  across, y cm away - correcting", each chassis correction and its distance,
+  the pickup coordinate, and the verdict. Callback errors are swallowed: a
+  listener must not abort a run that is already moving the arm.
+- `POST /api/grab/object/stream` writes those events as newline-delimited JSON
+  and flushes each one. `POST /api/grab/object` stays the plain blocking call
+  for agents. Because the stream's response is committed before the work runs,
+  a failure arrives as a final `{"stage":"error","ok":false}` event rather than
+  an HTTP status the client would never see.
+- The webpage reads the stream and renders each event in the chat log -
+  annotated frames included, via the existing `addChatImage` - with the arm
+  status line following along. Failures and the correction-limit stop render as
+  error messages.
+- Tests 170 to 172: the stream reports each step before the result with its
+  image payload, and a mid-run failure lands as a final error event. Verified
+  live against the robot camera: asking for a target that is not there streamed
+  `start` then `observe` with a 19 KB annotated frame and stopped without
+  moving the arm.
+
+## Webpage grab actions: guarded Grab object, blind Quick grab action
+
+- Removed the **Grab can** button and its handler. The recorded can pose is not
+  deleted - `grab_from_front` still runs it - but every description that called
+  it "the webpage's Grab can button" was corrected, in the MCP docstring, the
+  shared tool description, the realtime voice prompt, the README, and the
+  robot-physical-control reference.
+- Renamed the old **Grab object** button to **Quick grab action**. Same blind
+  fixed-point behaviour, a name that matches what it does, and demoted to the
+  secondary style so it no longer reads as the default way to pick something up.
+- New **Grab object** button runs the skill's procedure server-side via
+  `POST /api/grab/object` (`VisionGrasper.grab_object`): Check ground, pick the
+  target from Hermes boxes, drive bounded chassis corrections until the centre
+  is within 1 cm, pick up at `(2, 13, -1)`, lift to `(0, 15, 20)` still
+  holding, then confirm from two spaced frames. It reports the target, the
+  corrections, and the verdict; the button surfaces all three.
+- Details that carry the lessons of the failed grabs: a box touching any image
+  edge is treated as clipped and drives a correction instead of trusting its
+  centre; background labels (floor, wall, shadow, table...) and near-full-frame
+  boxes are excluded from target selection; identical confirmation frames
+  report `confirmed: null` (stuck stream) and never count as a hold; the
+  alignment loop stops after six corrections and reports the remaining offset.
+  One attempt only - `retry_requires_authorization: true` in the result.
+- `pickup_z` is a parameter (default `-1`, band `-3`..`2`), so an authorized
+  retry can lower it exactly as the skill helper does.
+- Tests 161 to 170: eight for the guided flow (centred pickup, bounded
+  correction, clipped box, missing object, stuck stream, empty near field,
+  depth bound, named target) plus the page and route assertions. Verified live:
+  the page shows Grab object and Quick grab action with no Grab can, and the
+  new route rejects an out-of-band depth.
+
+## Retries need operator permission, and the helper has a depth knob
+
+- `hibot-ground-grab` now states "One pickup per authorization. A failed or
+  unconfirmed grasp does not authorize another one." The original request does
+  not carry over, because a failed attempt usually moved the object and the
+  operator can see what the camera cannot. New step 8 requires stopping,
+  reporting the failed stage and what the camera showed, saying where the
+  object is now, and asking before any retry.
+- The ask must offer one adjustment, one thing at a time: re-approach (the most
+  common cause - a miss shoves the object out of the pickup zone), lower the
+  pickup 1 cm to `-2` for a flat or soft target the jaws slid over, or aim at a
+  bulkier part. After an authorized retry, report the adjustment and outcome.
+- `scripts/grab_ground.py` grew `--pickup-z` (default `-1`, band `-3` to `2`),
+  so a retry adjusts depth through the tested helper instead of a scratchpad
+  override. The default moves from `0` to `-1`, matching the webpage quick
+  action and the one confirmed pickup; the skill records what each depth did
+  (`0` pushed the toy away, `-1` held once and missed once on flat plush).
+- Corrected the stale note claiming the skill still picks up at `(2,13,0)`, and
+  the plan doc's step 5. Helper tests 10 to 12: the retry depth changes only
+  the pickup (lift and approach unmoved) and the safe band is enforced.
+
+## Single 190 degrees/s yaw calibration
+
+- Operator decision: both rotation paths now use 190 degrees/s.
+  `ROTATION_CALIBRATION_DEGREES_PER_SECOND` is 190, and `approach_bearing`
+  divides by that same constant instead of its old hard-coded 180, so a
+  bearing turn and a `rotate(degrees=...)` turn can no longer disagree.
+- Replaces two conflicting figures: this plan's 200 degrees/s (0.1 s = 20
+  degrees) and the platform notes' `180 degrees = 1.0 s`. 190 is a chosen
+  value, not a fresh measurement; docs say so rather than implying it was
+  measured.
+- Callable range moved with it: 9.5-1520 degrees (0.05-8 s at 190/s). The
+  generic amount bound was widened so the calibration check is what reports
+  the limit - asking for 1600 degrees now says "at most 1520 degrees" instead
+  of a generic range error. Tool schemas carry the real maxima (320 cm, 1520
+  degrees).
+- Updated in code, tool descriptions, MCP docstrings, README,
+  `docs/grab_object_plan.md`, the ground-grab skill's calibration table, and
+  the robot-physical-control reference; installed skill copies synced. 161
+  tests pass.
+
+## Distance and angle chassis actions (move, rotate)
+
+- Added `move` and `rotate` to the shared tool set, so MCP/voice callers can
+  ask for centimetres or degrees instead of hand-converting to seconds. Each
+  takes exactly one of the amount or `seconds`; both or neither is an error.
+  `move` covers forward/backward/left/right, `rotate` is pure yaw.
+- Conversions are the `docs/grab_object_plan.md` calibrations: 40 cm/s
+  forward/backward, 20 cm/s strafing, 200 degrees/s rotation, all at speed
+  setting 40. Results carry the requested amount, the calibration used, and
+  `distance_measured`/`angle_measured: false` - these are timed estimates with
+  no odometry or gyro behind them.
+- Two deliberate refusals instead of silent fudging: a distance request at a
+  speed other than 40 is refused (the calibration does not hold there - pass
+  seconds), and an amount whose duration falls outside 0.05-8 s is refused
+  with its callable range rather than clamped, since clamping would move a
+  different amount than asked. Ranges: 2-320 cm forward/backward, 1-160 cm
+  strafe, 10-1600 degrees.
+- Wired through `Robot.move`/`Robot.rotate`, `/api/agent/move`,
+  `/api/agent/rotate`, `ROBOT_TOOL_DEFINITIONS`, and MCP wrappers that omit the
+  unused half of the pair. Tests 153 to 161, covering the conversions, both
+  refusals, the schemas, the HTTP routes, and the MCP payloads.
+- Unreconciled conflict, left as-is and documented: `approach_bearing` still
+  uses the older `180 degrees = 1.0 s` platform figure while `rotate` uses this
+  plan's 200 degrees/s. Both are operator-supplied; neither was re-measured.
+
+## The refusal came from robot-physical-control, not the tool descriptions
+
+- After the tool/description fixes, the Hermes agent stopped calling the blind
+  quick action but still declined: "the available pickup action is a blind
+  fixed-coordinate grab ... Please place the toy at my marked pickup point."
+  That wording traces to the OTHER robotics skill, `robot-physical-control`,
+  whose camera-guided item 6 said "Ask the operator to stage the item on a
+  clear surface at the calibrated pickup point." Its description ("Use when
+  controlling a robot") matches any robot request, so it loads every time.
+- `robot-physical-control` now opens its camera-guided section with "Check for
+  a companion pickup skill first": a request to grab a named object off the
+  floor means loading `hibot-ground-grab` and following it, and seeing the
+  object but reporting it cannot be picked up without having loaded that skill
+  is called out as a failure to complete the request. Item 6 now distinguishes
+  a missing calibrated pickup from an object merely off the pickup point - the
+  companion skill drives the robot until the object is at that point. The
+  reporting section forbids declining a floor pickup as "unstaged" until that
+  skill's alignment has actually failed.
+- Fixed stale values in its MasterPi reference while there: check-front was
+  listed as servo 3=500, 5=810 with no gripper entry (actual: 3=1200, 5=1500,
+  1=2200), and the can profile's gripper as 2000/1500 (actual: the shared
+  2500/500). Added a ground-pickup section pointing at the skill.
+- That skill lived only in `~/.hermes/skills/`; copied it into the repo at
+  `skills/robot-physical-control/` so it is version-controlled like the other.
+  Skill files are read from disk per session, so no gateway restart is needed -
+  a new Hermes conversation picks this up.
+
+## Why the Hermes agent ignored the ground-grab skill
+
+- Hermes truncates every skill description to 60 characters in its
+  system-prompt index (`SKILL_PROMPT_DESC_LIMIT` in
+  `agent/skill_utils.py`). Ours rendered as "Track and pick up a staged ground
+  object with HiBot's gri..." - the trigger clause "Use for requests to locate,
+  align with, or grab a ground object" was cut off entirely, so a "grab the
+  toy" request matched nothing in the index.
+- Meanwhile `grab_from_ground` advertised itself as a ready-made pickup, so the
+  agent called the blind quick action, which closes the gripper at a fixed
+  coordinate and never looks for the object.
+- Fixes: the skill description now leads with "Grab an object off the floor:
+  find, center, pick up, verify" (first 57 characters carry the trigger) and
+  states that the quick action cannot find or center on an object. Both grab
+  tools - MCP docstrings and the shared `robot_tools` descriptions - now start
+  with "Blind" and point at the hibot-ground-grab skill for a named object.
+  A `test_robot_tools` assertion pins both properties.
+- Verified the rendered index via Hermes's own `build_skills_system_prompt`:
+  the line now reads "Grab an object off the floor: find, center, pick up,
+  veri...". The MCP tool descriptions reach Hermes from the `hibot_mcp`
+  subprocess the gateway spawned at 18:24, so they need a gateway restart.
+
+## Confirmed ground grab of the toy at z=-1
+
+- Ran the updated workflow: Check ground, one 0.1 s forward pulse to bring the
+  whole toy into frame, full-object center at `(308, 238)` against `(320, 240)`
+  - about 0.25 cm, the first attempt today with an unclipped box - then the
+  pickup at `(2, 13, -1)` with the frame center on the furry torso below the
+  plaid cape.
+- Confirmed held. Two capture pairs, seconds apart, both `stale_stream: false`,
+  all four frames differing: the toy fills the near field with the floor
+  receding behind it, against the bare-floor signature of the failed attempts.
+  Controller state: chassis stopped, gripper `500`, arm at `(0, 15, 20)`, no
+  error. The jaws are still not in view, so the hold is inferred from near-field
+  fill, but it is corroborated across two independent pairs.
+- What changed between the failures and this run: the whole object in frame
+  rather than a clipped box, a centered grasp point on thick plush rather than
+  the flat cape, and the 1 cm-lower pickup. The helper still ships `z=0`; this
+  run used a scratchpad override.
+
+## Paired confirmation capture and a hard centering gate
+
+- The camera stream can stick on an older frame, so a single post-lift capture
+  can show the pre-lift view - the object filling the near field while the arm
+  was still down at it - and read as a hold that never happened. This bit a
+  real run today: the retry's one confirmation frame showed the toy filling the
+  frame, every later frame showed the empty room, and the toy is now on the
+  floor beyond the pickup zone. The stale-frame reading is the likelier one;
+  that run should not have been reported as a confirmed grab.
+- `capture_after_lift` now takes **two** frames about 1.5 s apart, returns
+  `{"images": [...], "stale_stream": bool}`, and flags byte-identical frames as
+  a stuck stream. Step 7 of the skill says to judge from the later frame, treat
+  a stuck stream as proving nothing either way, and read a hold-then-room
+  sequence as a stale first frame rather than a hold that was lost.
+- Step 5 is now a gate, "Fine-align until the object center is at the frame
+  center": the object's own grasp center within 1 cm on both axes (about 49
+  pixels at the ground reference), a clipped box explicitly has no usable
+  center, and corrections must be re-measured on a fresh frame because short
+  pulses respond nonlinearly. Both failed grabs today had the jaws closing
+  beside a target whose center was off or whose box was clipped.
+- Helper tests 8 to 10: two spaced captures with the wait between them, and
+  stuck-stream detection. `capture_after_lift` takes the frame source, sleep,
+  and delay as arguments so the tests stay hardware-free. Live check against
+  the arm at the lift pose returned two differing frames, `stale_stream:
+  false`, both showing the room - nothing held. Installed copies synced.
+
+## Ground-grab skill confirms the hold from the camera after the lift
+
+- Step 7 of `hibot-ground-grab` is now "Confirm with the camera, then report":
+  a post-lift camera check is required, not optional. It states the read rule -
+  the gripper camera sits above the jaws, so a held object fills the near field
+  while the room recedes - and the three outcomes (held / failed or dropped /
+  ambiguous), with an explicit ban on upgrading an inference to a confirmed
+  hold. API success is called out as proof that commands ran, nothing more.
+- `scripts/grab_ground.py` now captures one pose-preserving frame after the
+  lift (reusing `observe.capture`, no movement commanded) and prints its path
+  as `confirmation_image`; `main` echoes it with a "inspect before reporting"
+  note. A capture failure prints `confirmation_error` and does not fail the
+  pickup, since the object may still be held. A failed pickup captures nothing.
+- Helper tests grew from six to eight: the confirmation path, the
+  capture-failure path, and no-capture-on-failure. `execute` takes the capture
+  as an injectable third argument, so tests stay hardware-free. Both installed
+  copies (Codex, Hermes) synced.
+- Live check of the new capture against the arm still at the lift pose: it
+  returned a frame with no arm movement. That frame showed bare floor and the
+  gripper reading `2500` (open) - the toy had been released after the earlier
+  run, so it is the "not held" signature, not a regression of the pickup.
+
+## Ground-grab skill now looks at the ground first, and first live pickup
+
+- Reordered `hibot-ground-grab`: step 1 is now Check ground + observation. If
+  the target is already in that view, the Check front alignment stage and the
+  20 cm approach are skipped and the run goes straight to fine-alignment. The
+  ground view is the one whose center maps to the pickup point, so the front
+  stage is only for targets that are absent or too far for small strafes.
+  Renumbered the remaining steps; synced both installed copies (Codex,
+  Hermes). `docs/grab_object_plan.md` summary and step list match.
+- First physical run of the pickup, on a stuffed toy: Check ground showed it
+  at image `(285, 240)` against center `(320, 240)` - about 0.7 cm left, inside
+  the 1 cm tolerance - so no chassis correction was needed. The ground-first
+  order found it immediately; the earlier Check front frame had shown only
+  floor and furniture.
+- `scripts/grab_ground.py --execute` ran all five stages: stop, open, arm
+  `(2,13,0)` at -68 degrees, close at 500, lift to `(0,15,20)`. Controller
+  reported chassis stopped, gripper 500, arm at the lift pose, no error. The
+  post-lift camera frame shows the toy filling the near field at lift height,
+  consistent with a successful hold; the jaws themselves are not in view, so
+  retention is probable but not visually proven.
+
+## Grab object starts from the current pose and picks up 1 cm lower
+
+- The web **Grab object** quick action (shared `grab_from_ground` routine) no
+  longer moves Home before picking up. It stops the chassis, opens the gripper,
+  and approaches from wherever the arm already is, so a hand- or jog-pad
+  alignment survives into the pickup.
+- `GROUND_PICKUP_XYZ` is now `(2, 13, -1)` cm, one centimetre lower. The hover
+  at `(2, 13, 8)`, the `-68` degree pickup pitch with range `[-90,-68]`, the
+  gripper presets, and the Home return while holding are unchanged.
+- Offline IK with the vendor SDK and the saved calibration offsets: `(2,13,-1)`
+  solves for pitches -86 through -68; at -68 the adjusted pulses are servo
+  3=1346, 4=2483, 5=2207, 6=1467, all inside `500-2500`. Pitches below -68 are
+  still rejected by servo 4, so -68 remains the preference.
+- Updated the tool description, MCP docstring, README, plan doc, and the
+  `hibot-ground-grab` skill cross-reference. The skill itself keeps its own
+  `(2,13,0)` pickup and `(0,15,20)` lift finish.
+- Verification: 153 controller tests and the six skill-helper tests pass. No
+  arm movement was commanded; the lowered pickup is not yet physically tried.
+
+## Revised Check ground center and ground-grab pickup
+
+- The operator's Check ground image-center reference is now `(2, 13, 0)` cm,
+  replacing `(0, 12, 0)`. The observation servo preset is unchanged.
+- Updated the shared ground-grab routine (web Grab object and MCP/voice
+  `grab_from_ground`) to approach `(2, 13, 8)` and pick up at `(2, 13, 0)`.
+  Used a -68-degree pickup pitch, full-range gripper presets,
+  no camera/color gate, and Home return. Returned pickup metadata matches.
+- Updated `docs/grab_object_plan.md`, README, tool descriptions, and the saved
+  skill/helper. The skill retains its distinct `(0, 15, 20)` lift finish.
+  Offline IK finds solutions for the new approach and pickup; no live pickup
+  or arm movement was performed during implementation.
+- Including calibration offsets, the old -66-degree pitch would command servo
+  4 to 2538; -68 degrees is the nearest valid pitch, commanding it to 2491.
+  Updated both the quick action and skill helper to use that pickup preference.
+- Verification: all 153 controller tests, six skill-helper tests, skill
+  validation, dry run, and diff checks pass. Offline SDK execution used a
+  fake board and checked adjusted pulses for approach, pickup, and lift.
+  Synced installed Hermes/Codex skills and reloaded controller, voice, and
+  gateway; all are active, with stopped chassis and no controller error.
+
+## Full-range gripper presets for web quick actions and MCP
+
+- Updated shared `Robot.gripper`: servo 1=2500 open, servo 1=500 closed.
+  Web quick buttons, standard gripper controls, arm jogs, MCP/voice, and pickup
+  routines all use these presets. Corrected the jog slider display and tool
+  descriptions. Check front/ground observation pulses remain at 2200.
+- Updated README, grab-plan notes, and the saved ground-grabbing skill to
+  match. Verification uses mock hardware only; no live gripper action runs.
+- Verification: 153 controller tests and six skill-helper tests pass, along
+  with JavaScript syntax, skill validation, and diff checks. Synced installed
+  Hermes/Codex skill notes and reloaded controller, voice, and Hermes gateway;
+  all three services are active. Live webpage has the updated presets;
+  read-only state confirms stopped chassis with no controller error.
+
+## Repeatable Hermes ground-object tracking/grabbing skill
+
+- Added `skills/hibot-ground-grab/SKILL.md` for the operator's staged workflow:
+  front alignment within 10 degrees/5 cm, approximately 20 cm forward, Check
+  ground, center within 1 cm, pickup `(0, 12, 0)`, close, lift `(0, 15, 20)`.
+  Ground image center is the operator's new `(0, 12, 0)` arm reference.
+- Added a pose-preserving camera/Hermes observation helper and an exact
+  Cartesian pickup/lift helper that performs no I/O unless `--execute` is
+  supplied. The existing MCP ground quick action remains unchanged and is
+  explicitly not substituted for the new geometry. No color-detector gate.
+- Recorded bounded correction loops, empirical distance/angle limitations,
+  target-loss/failure stopping, and post-action verification without opening
+  the gripper. Updated the grab plan; the original pickup proposal is historical.
+- Hardware-free helper tests, skill validation, and dry-run verification pass.
+  Installed and validated copies under the local Hermes robotics skills and
+  Codex skills directories. Six helper tests pass; no service restart needed.
+  No live approach, new ground pickup, gripper close, or lift was executed.
+
+## Operator-observed rotation calibration
+
+- Recorded in `docs/grab_object_plan.md`: a 0.1-second left/right rotation
+  corresponds to approximately 20 degrees at the current pure-rotation
+  commands (angular setting -0.6/+0.6, linear speed 0). This is an operator
+  observation, separate from lateral travel. Documentation only: no movement
+  or controller changes were performed for this update.
+
+## Can vertical reference and center-bottom calibration scope
+
+- Recorded the latest Hermes can box's vertical span: approximately 206 pixels
+  (`y_min=0.494`, `y_max=0.923`, frame height 480), with the operator's 14 cm
+  physical-length reference, giving approximately 0.0680 cm/pixel.
+- Recorded that image conversions hold only near center-bottom with matching
+  pose/depth/orientation, not throughout the image. The current can is left of
+  center; its span does not independently validate that mapping. The vertical
+  object ratio is not a calibrated forward-travel conversion. No movement or
+  controller changes were performed.
+
+## Operator-observed left/right travel calibration
+
+- Recorded in `docs/grab_object_plan.md`: a 0.1-second left/right move
+  corresponds to approximately 2 cm of lateral travel at speed setting 40.
+  Kept this separate from the forward/backward observation. Documentation
+  only: no movement or controller changes were performed.
+
+## Operator-observed forward/backward travel calibration
+
+- Recorded in `docs/grab_object_plan.md` that a 0.2-second forward/backward
+  move corresponds to approximately 8 cm at the recent speed setting of 40.
+  Identified this as an operator observation, distinct from the nominal 8 mm
+  speed-based estimate; the factor-of-ten discrepancy remains undiagnosed.
+  Documentation only: no movement or controller changes were performed.
+
+## Check front bottom-edge scale and default Hermes box method
+
+- Recorded the operator's calibration in `docs/grab_object_plan.md`: at the
+  Check front image bottom, 124 horizontal pixels correspond to 6 cm, giving
+  approximately 0.0484 cm/pixel and 31.0 cm across the 640-pixel bottom edge.
+  This supersedes the earlier 5.5 cm/124-pixel estimate for that reference.
+- Documented Hermes estimated bounding boxes as the default recognition,
+  annotation, and pixel-width method, not GrabCut or manually seeded masks.
+  Color detection remains an explicitly requested alternative. No controller
+  behavior, services, or robot position were changed for this documentation.
+
+## Check front distance reference and corrected lateral controls
+
+- Recorded the operator's Check front camera reference in
+  `docs/grab_object_plan.md`: the bottom image edge corresponds to a ground
+  position approximately 23 cm ahead of the robot, distinct from Check
+  ground's 2 cm reference and pixel scale.
+- Swapped chassis left/right strafing to left=0° and right=180° in the web
+  buttons, keyboard mappings, and MCP/voice `drive_for`. Mirrored the web's
+  diagonals consistently. Forward/backward, rotation, arm jogs, raw numeric
+  drive commands, and the four-wheel vendor mixer are unchanged.
+- Updated CLI help, agent tool descriptions, and documentation to match.
+- Verification passes all 151 controller tests, JavaScript syntax, and diff
+  checks. Reloaded the controller, wake-word service, and Hermes gateway;
+  verified the live lateral/diagonal/keyboard mappings and shared tool
+  description. All services are active with no controller error. No physical
+  motion or independent camera-distance measurement was performed.
+
+## Revised Check front pose and restored quick action
+
+- Check front now matches Check ground except servo 3=1200: servo 4=2500,
+  servo 5=1500, servo 6=1500, and gripper servo 1=2200, over 0.8 seconds.
+  Updated the shared controller pose, MCP/voice tool descriptions, camera
+  analysis expectations, and documentation. Check ground remains unchanged.
+- Restored the Check front quick-arm button alongside Check ground. Camera
+  analysis continues to use Check front, now including the explicit gripper
+  setting; the ground-camera calibration does not transfer to this new pose.
+- Verification passes all 150 controller tests, JavaScript syntax, and diff
+  checks. Reloaded all three robot/voice/gateway services and verified both
+  live quick buttons and Hermes's cached Check front description with the
+  exact new pulses. Services are active with no controller error; no pose or
+  physical movement was executed.
+
+## Ground-grab plan and observation-only test
+
+- Wrote `docs/grab_object_plan.md` for the proposed Check ground → center
+  inspection → `(0, 15, 1)` pickup → gripper close → `(0, 15, 20)` lift test.
+  It distinguishes image centering from distance/pose calibration and leaves
+  pickup/lift pitch validation and execution for a separately requested test.
+- Executed only the requested Check ground observation pose and captured the
+  existing camera stream after settling. Hermes vision detected a red drink
+  can near horizontal image center on a wooden surface; the can is cropped at
+  the top and bottom, so pickup alignment/distance are not established.
+- Generated an annotated image and recorded the detections in the plan. No
+  pickup, close-gripper, lift, chassis motion, or Home command was executed.
+
+## Check ground replaces the Check front quick button
+
+- Removed the Check front button and its JavaScript handler from the webpage.
+  Check ground now occupies its quick-arm slot, with the saved servo/gripper
+  values unchanged. Check front remains available to camera analysis and
+  MCP/API requests.
+- Verification passes all 149 controller tests, JavaScript syntax, and diff
+  checks. Restarted the web controller and confirmed its live page contains
+  exactly one Check ground button and no Check front button/handler. No arm
+  movement was triggered.
+
+## Recorded Check ground arm preset
+
+- Saved Check ground as servo pulses 3=500, 4=2500, 5=1500, 6=1500,
+  and gripper servo 1=2200. Added the quick-arm button, manual pose API,
+  loopback agent route, and shared MCP/voice tool with a 0.8-second default.
+- Check front remains 3=500, 4=2500, 5=810, 6=1500 and leaves the gripper
+  unchanged. Corrected its stale agent-tool description, which said 5=1350.
+- Standard gripper open/close presets and both grab actions are unchanged.
+- Verification passes all 149 controller tests and the embedded JavaScript
+  syntax check. Reloaded the controller, wake-word listener, and Hermes gateway;
+  all are active, the live webpage includes Check ground, and Hermes caches
+  20 tools including `check_ground`. No pose or physical movement was executed.
+
+2026-09-10
+
+## Physical Button 1 dance control
+
+- Connected expansion-board KEY1/Button 1 (GPIO13) to the same asynchronous
+  Dance launcher used by the webpage, including synchronized audio and
+  duplicate-run protection. KEY2 continues to move the arm Home.
+- KEY1 accepts the board's press and click event variants, debounces duplicate
+  events, records successful starts in controller state, and reports launcher
+  failures through `last_error`.
+- Verification passes all 145 MasterPi tests. The controller was restarted and
+  is active; its live state exposes `button_dance_count` with no error. No real
+  button press, dance, audio playback, or robot movement was invoked.
+
 2026-09-09
 
 ## Original vendor directory rename

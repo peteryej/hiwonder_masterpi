@@ -46,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
 
     drive = sub.add_parser("drive", help="drive briefly, then stop")
     drive.add_argument("speed", type=float, help="linear speed, 0..100 mm/s")
-    drive.add_argument("direction", type=float, help="0 right, 90 forward, 180 left, 270 back")
+    drive.add_argument("direction", type=float, help="0 left, 90 forward, 180 right, 270 back (robot-calibrated)")
     drive.add_argument("--angular", type=float, default=0, help="yaw rate, -2..2 rad/s")
     drive.add_argument("--seconds", type=float, default=1.0, help="duration before automatic stop")
 

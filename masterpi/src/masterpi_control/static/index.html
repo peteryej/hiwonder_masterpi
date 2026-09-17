@@ -35,6 +35,9 @@
     .camera-card { grid-column: 1 / -1; }
     .control-card { grid-column: 1 / -1; }
     .chat-card { grid-column: 1 / -1; }
+    .chat-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .chat-header h2 { margin-bottom: 14px; }
+    .chat-header button { padding: 7px 11px; font-size: .85rem; }
     .chat-messages { min-height: 120px; max-height: 320px; overflow-y: auto; display: grid; align-content: start; gap: 9px; padding: 12px; border-radius: 10px; background: #0f1722; }
     .chat-message { width: fit-content; max-width: 85%; margin: 0; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     .chat-message.user { justify-self: end; background: #294fae; }
@@ -157,9 +160,9 @@
         </div>
         <div class="control-panel drive-panel">
           <div class="pad">
-            <button class="drive secondary" data-direction="135">↖</button><button class="drive" data-direction="90">▲</button><button class="drive secondary" data-direction="45">↗</button>
-            <button class="drive" data-direction="180">◀</button><button id="stop" class="stop">STOP</button><button class="drive" data-direction="0">▶</button>
-            <button class="drive secondary" data-direction="225">↙</button><button class="drive" data-direction="270">▼</button><button class="drive secondary" data-direction="315">↘</button>
+            <button class="drive secondary" data-direction="45">↖</button><button class="drive" data-direction="90">▲</button><button class="drive secondary" data-direction="135">↗</button>
+            <button class="drive" data-direction="0">◀</button><button id="stop" class="stop">STOP</button><button class="drive" data-direction="180">▶</button>
+            <button class="drive secondary" data-direction="315">↙</button><button class="drive" data-direction="270">▼</button><button class="drive secondary" data-direction="225">↘</button>
           </div>
           <div class="turns">
             <button class="turn secondary" data-angular="-0.6">↶ Rotate</button>
@@ -175,8 +178,9 @@
           <div class="quick-controls">
             <button id="quickHome" class="secondary">Home</button>
             <button id="quickCheckFront" class="secondary">Check front</button>
-            <button id="quickGrab">Grab object</button>
-            <button id="quickGrabCan">Grab can</button>
+            <button id="quickCheckGround" class="secondary">Check ground</button>
+            <button id="quickGrabObject">Grab object</button>
+            <button id="quickGrab" class="secondary">Quick grab action</button>
             <button id="quickOpen" class="secondary">Open gripper</button>
             <button id="quickClose" class="secondary">Close gripper</button>
             <button id="quickNod" class="secondary">Nod</button>
@@ -187,7 +191,10 @@
       </div>
     </section>
     <section id="chatSection" class="chat-card">
-      <h2>Chat with hibot</h2>
+      <div class="chat-header">
+        <h2>Chat with hibot</h2>
+        <button id="newChatSession" class="secondary" title="Start a fresh conversation, dropping earlier context">New chat</button>
+      </div>
       <div id="chatMessages" class="chat-messages" role="log" aria-live="polite">
         <p class="chat-message hibot">Hi, I’m hibot. Type a message or send me a voice recording.</p>
       </div>
@@ -320,6 +327,24 @@
       chatState.textContent = 'Audio is enabled; your browser may require one Play tap.';
     });
   });
+
+  const newChatSession = document.querySelector('#newChatSession');
+  newChatSession.onclick = async () => {
+    newChatSession.disabled = true;
+    try {
+      // A fresh Hermes session: the old one keeps its history, including any
+      // stale refusal or superseded instruction, in every later reply.
+      const result = await api('chat/new', {});
+      chatMessages.replaceChildren();
+      thinkingMessage = null;
+      addChatMessage('hibot', 'Started a new chat. Earlier messages are no longer in my context.');
+      chatState.textContent = `New session: ${result.session}`;
+    } catch (error) {
+      addChatMessage('error', error.message);
+    } finally {
+      newChatSession.disabled = false;
+    }
+  };
 
   function addChatMessage(who, text) {
     const message = document.createElement('p');
@@ -590,7 +615,7 @@
   });
   document.querySelector('#stop').onclick = () => stopHold();
 
-  const keyCommands = {w:drive(90), ArrowUp:drive(90), d:drive(0), ArrowRight:drive(0), s:drive(270), ArrowDown:drive(270), a:drive(180), ArrowLeft:drive(180), q:turn(-0.6), e:turn(0.6)};
+  const keyCommands = {w:drive(90), ArrowUp:drive(90), d:drive(180), ArrowRight:drive(180), s:drive(270), ArrowDown:drive(270), a:drive(0), ArrowLeft:drive(0), q:turn(-0.6), e:turn(0.6)};
   addEventListener('keydown', event => {
     if (event.target.matches('input') || event.repeat) return;
     if (event.code === 'Space') { event.preventDefault(); stopHold(); return; }
@@ -669,7 +694,7 @@
         {opened, duration:0.5},
         opened ? 'Gripper fully opened.' : 'Gripper closed.'
       );
-      if (accepted) setServoSliderValue(1, opened ? 2000 : 1500);
+      if (accepted) setServoSliderValue(1, opened ? 2500 : 500);
       return accepted;
     }, 0.5);
   }
@@ -693,30 +718,75 @@
   document.querySelector('#quickHome').onclick = homeArm;
   document.querySelector('#quickCheckFront').onclick = () =>
     sendArmCommand('pose/check_front', {duration:0.8}, 'Arm moved to the Check front pose.');
+  document.querySelector('#quickCheckGround').onclick = () =>
+    sendArmCommand('pose/check_ground', {duration:0.8}, 'Arm moved to the Check ground pose.');
+  const quickGrabObject = document.querySelector('#quickGrabObject');
+  // Each step of the guided grab lands in the chat log as it happens: what the
+  // camera saw, every correction and why, then the verdict. A single result at
+  // the end would hide a run that moves the robot for half a minute.
+  async function streamGrabObject(body={}) {
+    const response = await fetch('/api/grab/object/stream', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body),
+    });
+    if (!response.ok || !response.body) {
+      const failure = await response.json().catch(() => ({}));
+      throw new Error(failure.error || 'Grab object could not start');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let last = null;
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream:true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        last = event;
+        if (event.stage === 'done') continue;
+        addChatMessage(event.stage === 'error' || event.stage === 'failed' ? 'error' : 'step', event.text);
+        if (event.image) addChatImage(event.image, event.text);
+        if (event.text) setArmStatus(event.text, event.stage === 'error' || event.stage === 'failed');
+      }
+    }
+    if (!last || last.ok === false) throw new Error(last?.text || 'Grab object stopped unexpectedly');
+    return last.result;
+  }
+  quickGrabObject.onclick = async () => {
+    quickGrabObject.disabled = true;
+    addChatMessage('user', 'Grab object');
+    setArmStatus('Looking at the ground, centring the object, then picking it up…');
+    try {
+      const result = await streamGrabObject({});
+      const summary = result?.grabbed
+        ? `Picked up the ${result.target} and holding it at the lift pose.`
+        : result?.confirmed === null
+          ? `Pickup ran, but the camera could not confirm a hold.`
+          : `Did not grab it: ${result?.reason || result?.confirmation?.reason || 'unknown reason'}.`;
+      addChatMessage('hibot', summary);
+      setArmStatus(summary, !result?.grabbed);
+    } catch (error) {
+      addChatMessage('error', error.message);
+      setArmStatus(error.message, true);
+    } finally {
+      quickGrabObject.disabled = false;
+    }
+  };
   const quickGrab = document.querySelector('#quickGrab');
   quickGrab.onclick = async () => {
     quickGrab.disabled = true;
-    setArmStatus('Grabbing the object directly in front…');
+    setArmStatus('Running the blind fixed-point pickup…');
     try {
       await api('grab', {force:true});
-      setArmStatus('Grab completed and arm returned Home.');
+      setArmStatus('Quick grab action completed and arm returned Home.');
     } catch (error) {
       setArmStatus(error.message, true);
     } finally {
       quickGrab.disabled = false;
-    }
-  };
-  const quickGrabCan = document.querySelector('#quickGrabCan');
-  quickGrabCan.onclick = async () => {
-    quickGrabCan.disabled = true;
-    setArmStatus('Running the recorded can-grab action…');
-    try {
-      await api('grab', {force:true, pickup:'can'});
-      setArmStatus('Can-grab action completed and arm returned Home.');
-    } catch (error) {
-      setArmStatus(error.message, true);
-    } finally {
-      quickGrabCan.disabled = false;
     }
   };
   document.querySelector('#open').onclick = () => api('gripper', {opened:true});

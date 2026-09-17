@@ -51,8 +51,14 @@ def home_arm(duration: float = 1.5) -> dict[str, Any]:
 
 @mcp.tool()
 def check_front(duration: float = 0.8) -> dict[str, Any]:
-    """Move the camera arm to the exact documented check-front pose."""
+    """Match Check ground except servo 3=1200; set 4=2500, 5=1500, 6=1500, 1=2200."""
     return dispatch_robot_tool(client, "check_front", {"duration": duration})
+
+
+@mcp.tool()
+def check_ground(duration: float = 0.8) -> dict[str, Any]:
+    """Move to the recorded check-ground pose with gripper servo 1 at 2200."""
+    return dispatch_robot_tool(client, "check_ground", {"duration": duration})
 
 
 @mcp.tool()
@@ -67,7 +73,7 @@ def set_servo(servo_id: int, pulse: int, duration: float = 0.5) -> dict[str, Any
 
 @mcp.tool()
 def set_gripper(opened: bool, duration: float = 0.5) -> dict[str, Any]:
-    """Open or close hibot's gripper using its validated presets."""
+    """Open gripper at servo 1=2500 or close at servo 1=500."""
     return dispatch_robot_tool(
         client, "set_gripper", {"opened": opened, "duration": duration}
     )
@@ -75,13 +81,30 @@ def set_gripper(opened: bool, duration: float = 0.5) -> dict[str, Any]:
 
 @mcp.tool()
 def grab_from_ground() -> dict[str, Any]:
-    """Pick up an object from the fixed ground-level coordinate and return Home."""
+    """Blind fixed-point pickup at (2, 13, -1) cm, then Home. Finds nothing.
+
+    This is the webpage's Grab object quick action: it closes the gripper at
+    one hard-coded coordinate. It does not look for an object, center on one,
+    or check whether anything was picked up, so it only works when the object
+    is already staged at that exact point.
+
+    Do NOT use it to grab a named object ("grab the toy", "pick up the can off
+    the floor"). Load the hibot-ground-grab skill and follow it instead: it
+    looks at the ground, centers the object in the frame, picks up, and
+    confirms the hold from the camera.
+    """
     return dispatch_robot_tool(client, "grab_from_ground")
 
 
 @mcp.tool()
 def grab_from_front() -> dict[str, Any]:
-    """Run the webpage Grab can front-pickup pose and return Home."""
+    """Blind recorded can pose (servos 3-6), then Home. Finds nothing.
+
+    The operator-recorded can pose, run as-is with no camera check. Its
+    webpage button has been removed, so this tool is the only caller left: use
+    it for a can already staged at the recorded pickup point. To grab a named
+    object off the floor, use the hibot-ground-grab skill.
+    """
     return dispatch_robot_tool(client, "grab_from_front")
 
 
@@ -106,6 +129,49 @@ def drive_for(
         client,
         "drive_for",
         {"direction": direction, "speed": speed, "duration": duration},
+    )
+
+
+@mcp.tool()
+def move(
+    direction: str,
+    distance_cm: float | None = None,
+    seconds: float | None = None,
+    speed: float = 40.0,
+) -> dict[str, Any]:
+    """Drive forward, backward, left, or right by distance_cm OR seconds.
+
+    Give exactly one of distance_cm or seconds. Distance is converted with the
+    operator calibration at speed 40 - about 40 cm/s forward/backward, 20 cm/s
+    strafing - so it is a timed estimate, not odometry; the robot does not
+    measure how far it actually went. Ranges: 2-320 cm forward/backward,
+    1-160 cm left/right, 0.05-8 seconds. For a speed other than 40, pass
+    seconds, since the calibration does not hold there.
+    """
+    arguments = {"direction": direction, "speed": speed, "distance_cm": distance_cm, "seconds": seconds}
+    # Omit the unused one so the controller sees exactly one of the pair.
+    return dispatch_robot_tool(
+        client, "move", {k: v for k, v in arguments.items() if v is not None}
+    )
+
+
+@mcp.tool()
+def rotate(
+    direction: str,
+    degrees: float | None = None,
+    seconds: float | None = None,
+    speed: float = 40.0,
+) -> dict[str, Any]:
+    """Rotate in place left or right by degrees OR seconds, with no translation.
+
+    Give exactly one of degrees or seconds. Degrees are converted with the
+    operator calibration of 190 degrees/s; there is no gyro or odometry, so the
+    angle is an estimate. Ranges: 9.5-1520 degrees, 0.05-8 seconds.
+    """
+    arguments = {"direction": direction, "speed": speed, "degrees": degrees, "seconds": seconds}
+    # Omit the unused one so the controller sees exactly one of the pair.
+    return dispatch_robot_tool(
+        client, "rotate", {k: v for k, v in arguments.items() if v is not None}
     )
 
 

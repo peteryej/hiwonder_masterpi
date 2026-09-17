@@ -20,10 +20,10 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlsplit
 
 from .camera import CameraStream, CameraUnavailable
-from .chat import HermesChat
+from .chat import ChatError, HermesChat
 from .robot import Robot, RobotError, ValidationError
 from .sound import ReSpeakerDirection, SoundTracker, SoundUnavailable
-from .vision import VisionGrasper, annotate_object_detections
+from .vision import GROUND_PICKUP_XYZ, VisionGrasper, annotate_object_detections
 from .voice_status import read_voice_status
 
 LOG = logging.getLogger(__name__)
@@ -136,6 +136,7 @@ def make_handler(
     )
     tracker = sound_tracker or SoundTracker(robot)
     dancer = dance_launcher or DanceLauncher()
+    robot.set_button1_action(lambda: dancer.start(dance_controller_url))
 
     def recognize_and_grab(data: Dict[str, Any]) -> Dict[str, Any]:
         if grasper is None:
@@ -147,6 +148,20 @@ def make_handler(
             return grasper.grab_front(data.get("pickup", "default"))
         return grasper.recognize_and_grab(
             data.get("target", "any"), data.get("pickup", "default")
+        )
+
+    def grab_object(
+        data: Dict[str, Any],
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Run the hibot-ground-grab procedure behind the Grab object action."""
+        if grasper is None:
+            raise CameraUnavailable("Camera-guided grasping is not configured")
+        return grasper.grab_object(
+            chat_service.analyze_image,
+            data.get("target"),
+            data.get("pickup_z", GROUND_PICKUP_XYZ[2]),
+            on_event,
         )
 
     def agent_grab_from_ground(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,6 +247,98 @@ def make_handler(
         )
         return requested.pop() if len(requested) == 1 else None
 
+    def start_chat_session(_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop the web chat's conversation history and start a fresh one.
+
+        The web chat continues one long-lived Hermes session, so stale context
+        -- an earlier refusal, a superseded instruction, a scene from minutes
+        ago -- keeps influencing new replies. This is the way out.
+        """
+        return {"session": chat_service.new_session()}
+
+    def chat_motion_request(message: str) -> Optional[Dict[str, Any]]:
+        """Recognize an explicit chassis movement asked for in web chat.
+
+        Web chat has no robot tools, so without this a "move left 10 cm" only
+        ever produced prose -- including refusals for obstacles the model
+        cannot actually judge. An explicitly named move is executed here.
+        """
+        normalized = message.lower()
+        if re.search(
+            r"\b(?:do not|don't|never)\s+(?:please\s+)?"
+            r"(?:move|drive|go|turn|rotate|spin|strafe)\b",
+            normalized,
+        ):
+            return None
+        match = re.search(
+            r"\b(move|drive|go|strafe|turn|rotate|spin)\b[^.!?]{0,40}?"
+            r"\b(forwards?|ahead|straight|backwards?|back|left|right)\b",
+            normalized,
+        )
+        if match is None:
+            return None
+        direction = {
+            "forward": "forward", "forwards": "forward", "ahead": "forward",
+            "straight": "forward", "backward": "backward", "backwards": "backward",
+            "back": "backward", "left": "left", "right": "right",
+        }[match.group(2)]
+        tail = normalized[match.end():]
+        degrees = re.search(r"(\d+(?:\.\d+)?)\s*(?:degrees?|degs?|°)", tail)
+        centimetres = re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:centimet(?:re|er)s?|cms?)\b", tail
+        )
+        seconds = re.search(r"(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b", tail)
+        turning = match.group(1) in ("turn", "rotate", "spin") or degrees is not None
+        if turning and direction in ("left", "right"):
+            if seconds is not None and degrees is None:
+                return {"kind": "rotate", "direction": direction,
+                        "seconds": float(seconds.group(1))}
+            # A bare "turn left" gets a stated default rather than a question.
+            return {"kind": "rotate", "direction": direction,
+                    "degrees": float(degrees.group(1)) if degrees else 45.0,
+                    "defaulted": degrees is None}
+        if centimetres is not None:
+            return {"kind": "move", "direction": direction,
+                    "distance_cm": float(centimetres.group(1))}
+        if seconds is not None:
+            return {"kind": "move", "direction": direction,
+                    "seconds": float(seconds.group(1))}
+        return {"kind": "move", "direction": direction, "distance_cm": 10.0,
+                "defaulted": True}
+
+    def run_chat_motion(motion: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a chat-requested move and describe what was done."""
+        direction = motion["direction"]
+        defaulted = motion.get("defaulted", False)
+        if motion["kind"] == "rotate":
+            result = robot.rotate(
+                direction, motion.get("degrees"), motion.get("seconds")
+            )
+            amount = (
+                f"{motion['degrees']:g} degrees" if "degrees" in motion
+                else f"{motion['seconds']:g} s"
+            )
+            text = (
+                f"Rotated {direction} {amount} ({result['duration']:g} s at "
+                f"{result['calibration_degrees_per_second']:g} degrees/s). Timed "
+                "estimate, no gyro."
+            )
+        else:
+            result = robot.move(
+                direction, motion.get("distance_cm"), motion.get("seconds")
+            )
+            amount = (
+                f"{motion['distance_cm']:g} cm" if "distance_cm" in motion
+                else f"{motion['seconds']:g} s"
+            )
+            text = (
+                f"Moved {direction} {amount} ({result['duration']:g} s at speed "
+                f"{result['speed']:g}). Timed estimate, not odometry."
+            )
+        if defaulted:
+            text += " You did not give an amount, so I used the default."
+        return {"text": text, "action": {"name": motion["kind"], "result": result}}
+
     def chat_reply(data: Dict[str, Any]) -> Dict[str, Any]:
         message = data.get("message")
         if not isinstance(message, str) or not message.strip():
@@ -239,6 +346,11 @@ def make_handler(
         message = message.strip()
         if len(message) > 4000:
             raise ValidationError("message must be at most 4000 characters")
+        motion = chat_motion_request(message)
+        if motion is not None:
+            # Just do it: an explicitly named bounded move is not gated on a
+            # camera check, and never declined over what a frame seems to show.
+            return run_chat_motion(motion)
         if camera_question(message) or color_detection_request(message):
             if color_detection_request(message):
                 scene = analyze_color_camera({"samples": 3})
@@ -398,6 +510,37 @@ def make_handler(
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
+        def _stream_grab_object(self, data: Dict[str, Any]) -> None:
+            """Run Grab object, writing each step as it happens.
+
+            The run takes tens of seconds and moves the robot, so the operator
+            needs to see what it saw and why it moved while it is happening,
+            not a single verdict at the end. Newline-delimited JSON keeps the
+            client a three-line reader.
+            """
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def write(event: Dict[str, Any]) -> None:
+                self.wfile.write(json.dumps(event).encode("utf-8") + b"\n")
+                self.wfile.flush()
+
+            try:
+                result = grab_object(data, write)
+            except (RobotError, CameraUnavailable, ChatError) as exc:
+                # The response is already committed, so an error is the last
+                # event rather than an HTTP status the client never sees.
+                write({"stage": "error", "text": str(exc), "ok": False})
+                return
+            except Exception as exc:  # pragma: no cover - unexpected failure
+                LOG.exception("Grab object stream failed")
+                write({"stage": "error", "text": str(exc), "ok": False})
+                return
+            write({"stage": "done", "ok": True, "result": result})
+
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
             if path.startswith("/api/agent/") and self.client_address[0] not in {"127.0.0.1", "::1"}:
@@ -407,6 +550,9 @@ def make_handler(
                 )
                 return
             try:
+                if path == "/api/grab/object/stream":
+                    self._stream_grab_object(self._read_json())
+                    return
                 if path == "/api/chat/audio":
                     audio, content_type = self._read_audio()
                     transcript = chat_service.transcribe(audio, content_type)
@@ -430,6 +576,7 @@ def make_handler(
                 data = self._read_json()
                 actions: Dict[str, Callable[[Dict[str, Any]], Any]] = {
                     "/api/chat": chat_reply,
+                    "/api/chat/new": start_chat_session,
                     "/api/drive": lambda d: robot.drive(
                         d.get("speed"), d.get("direction"), d.get("angular_rate", 0)
                     ),
@@ -447,6 +594,9 @@ def make_handler(
                     "/api/pose/check_front": lambda d: robot.check_front(
                         d.get("duration", 0.8)
                     ),
+                    "/api/pose/check_ground": lambda d: robot.check_ground(
+                        d.get("duration", 0.8)
+                    ),
                     "/api/gesture/nod": lambda d: robot.nod(),
                     "/api/gesture/shake": lambda d: robot.shake(),
                     "/api/servo": lambda d: robot.servo(
@@ -456,6 +606,7 @@ def make_handler(
                         d.get("opened"), d.get("duration", 0.5)
                     ),
                     "/api/grab": recognize_and_grab,
+                    "/api/grab/object": grab_object,
                     "/api/dance": lambda d: dancer.start(dance_controller_url),
                     "/api/camera/analyze": analyze_hermes_camera,
                     "/api/camera/analyze/color": analyze_color_camera,
@@ -474,6 +625,18 @@ def make_handler(
                     "/api/agent/drive_for": lambda d: robot.drive_for(
                         d.get("direction"), d.get("duration", 1.0), d.get("speed", 40)
                     ),
+                    "/api/agent/move": lambda d: robot.move(
+                        d.get("direction"),
+                        d.get("distance_cm"),
+                        d.get("seconds"),
+                        d.get("speed", 40),
+                    ),
+                    "/api/agent/rotate": lambda d: robot.rotate(
+                        d.get("direction"),
+                        d.get("degrees"),
+                        d.get("seconds"),
+                        d.get("speed", 40),
+                    ),
                     "/api/agent/avoid_obstacles": lambda d: robot.avoid_obstacles(
                         d.get("duration"), d.get("speed", 40), d.get("clearance_cm", 30)
                     ),
@@ -490,6 +653,9 @@ def make_handler(
                     "/api/agent/check_front": lambda d: robot.check_front(
                         d.get("duration", 0.8)
                     ),
+                    "/api/agent/check_ground": lambda d: robot.check_ground(
+                        d.get("duration", 0.8)
+                    ),
                     "/api/agent/nod": lambda d: robot.nod(),
                     "/api/agent/shake": lambda d: robot.shake(),
                     "/api/agent/dance": lambda d: dancer.start(
@@ -499,6 +665,7 @@ def make_handler(
                     "/api/agent/gripper": lambda d: robot.gripper(
                         d.get("opened"), d.get("duration", 0.5)
                     ),
+                    "/api/agent/grab_object": grab_object,
                     "/api/agent/grab_from_ground": agent_grab_from_ground,
                     "/api/agent/grab_from_front": agent_grab_from_front,
                     "/api/agent/camera_analyze": analyze_hermes_camera,

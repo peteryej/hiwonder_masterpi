@@ -57,8 +57,8 @@ class RobotTests(unittest.TestCase):
         self.assertEqual((home["x"], home["y"], home["z"]), (0.0, 6.0, 18.0))
         opened = self.robot.gripper(True)
         closed = self.robot.gripper(False)
-        self.assertEqual(opened["pulse"], 2000)
-        self.assertEqual(closed["pulse"], 1500)
+        self.assertEqual(opened["pulse"], 2500)
+        self.assertEqual(closed["pulse"], 500)
 
     def test_check_front_sets_exact_servo_targets(self):
         result = self.robot.check_front()
@@ -66,13 +66,48 @@ class RobotTests(unittest.TestCase):
         self.assertEqual(result["duration"], 0.8)
         self.assertEqual(
             [(item["servo_id"], item["pulse"]) for item in result["servos"]],
-            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
+            [(3, 1200), (4, 2500), (5, 1500), (6, 1500), (1, 2200)],
         )
         servo_events = [event for event in self.backend.events if event["action"] == "servo"]
         self.assertEqual(
             [(event["servo_id"], event["pulse"], event["duration"]) for event in servo_events],
-            [(3, 500, 0.8), (4, 2500, 0.8), (5, 810, 0.8), (6, 1500, 0.8)],
+            [(3, 1200, 0.8), (4, 2500, 0.8), (5, 1500, 0.8), (6, 1500, 0.8), (1, 2200, 0.8)],
         )
+
+    def test_check_front_matches_check_ground_except_servo3(self):
+        front = {
+            item["servo_id"]: item["pulse"]
+            for item in self.robot.check_front()["servos"]
+        }
+        ground = {
+            item["servo_id"]: item["pulse"]
+            for item in self.robot.check_ground()["servos"]
+        }
+        self.assertEqual(front.pop(3), 1200)
+        self.assertEqual(ground.pop(3), 500)
+        self.assertEqual(front, ground)
+
+    def test_check_ground_sets_recorded_arm_and_gripper_targets(self):
+        result = self.robot.check_ground(1.2)
+        self.assertEqual(result["pose"], "check_ground")
+        self.assertEqual(result["duration"], 1.2)
+        expected = [(3, 500), (4, 2500), (5, 1500), (6, 1500), (1, 2200)]
+        self.assertEqual(
+            [(item["servo_id"], item["pulse"]) for item in result["servos"]],
+            expected,
+        )
+        servo_events = [event for event in self.backend.events if event["action"] == "servo"]
+        self.assertEqual(
+            [(event["servo_id"], event["pulse"], event["duration"]) for event in servo_events],
+            [(servo_id, pulse, 1.2) for servo_id, pulse in expected],
+        )
+        self.assertEqual(self.robot.snapshot()["servos"]["1"]["pulse"], 2200)
+
+    def test_check_ground_rejects_invalid_duration_before_moving(self):
+        before = len(self.backend.events)
+        with self.assertRaises(ValidationError):
+            self.robot.check_ground(0)
+        self.assertEqual(len(self.backend.events), before)
 
     def test_nod_starts_and_ends_at_home_with_safe_servo3_motion(self):
         with patch("masterpi_control.robot.time.sleep"):
@@ -130,10 +165,39 @@ class RobotTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(self.robot.snapshot()["button_home_count"], 1)
 
-    def test_key1_press_does_not_move_arm(self):
+    def test_key1_press_starts_configured_dance_without_direct_arm_motion(self):
+        calls = []
+        self.robot.set_button1_action(lambda: calls.append("dance"))
         self.backend.press_button(1)
-        time.sleep(0.1)
-        self.assertIsNone(self.robot.snapshot()["arm"])
+        deadline = time.monotonic() + 0.5
+        while self.robot.snapshot()["button_dance_count"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        state = self.robot.snapshot()
+        self.assertEqual(calls, ["dance"])
+        self.assertEqual(state["button_dance_count"], 1)
+        self.assertEqual(state["last_button"], {"button": 1, "action": "dance"})
+        self.assertIsNone(state["arm"])
+
+    def test_key1_press_and_click_are_debounced(self):
+        calls = []
+        self.robot.set_button1_action(lambda: calls.append("dance"))
+        self.backend.press_button(1)
+        self.backend.click_button(1)
+        time.sleep(0.2)
+        self.assertEqual(calls, ["dance"])
+
+    def test_key1_dance_failure_is_reported(self):
+        def fail():
+            raise RuntimeError("launcher unavailable")
+
+        self.robot.set_button1_action(fail)
+        self.backend.press_button(1)
+        deadline = time.monotonic() + 0.5
+        while self.robot.snapshot()["last_error"] is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        state = self.robot.snapshot()
+        self.assertEqual(state["button_dance_count"], 0)
+        self.assertEqual(state["last_error"], "KEY1 Dance failed: launcher unavailable")
 
     def test_ultrasonic_distance_is_reported_in_both_units(self):
         self.robot.backend.mock_distance_mm = 437
@@ -194,6 +258,15 @@ class RobotTests(unittest.TestCase):
         self.assertTrue(all(event["direction"] == 90.0 for event in motion_events))
         self.assertEqual(drive_events[-1]["speed"], 0.0)
 
+    def test_drive_for_lateral_directions_match_corrected_webpage(self):
+        for direction, heading in (("left", 0.0), ("right", 180.0)):
+            with self.subTest(direction=direction):
+                with patch.object(self.robot, "_run_drive_for") as run:
+                    result = self.robot.drive_for(direction, duration=0.2)
+                run.assert_called_once_with(40.0, heading, 0.0, 0.2)
+                self.assertEqual(result["direction"], direction)
+                self.assertEqual(result["heading"], heading)
+
     def test_drive_for_rotation_matches_webpage_without_translation(self):
         with patch("masterpi_control.robot.time.sleep"), patch(
             "masterpi_control.robot.time.monotonic", side_effect=itertools.count(0, 0.1)
@@ -211,12 +284,13 @@ class RobotTests(unittest.TestCase):
         self.assertTrue(all(event["speed"] == 0.0 for event in motion_events))
         self.assertTrue(all(event["direction"] == 90.0 for event in motion_events))
 
-    def test_180_degree_bearing_rotation_uses_one_second_calibration(self):
+    def test_bearing_turn_shares_the_rotate_yaw_calibration(self):
         self.robot.backend.mock_distance_mm = 200
         with patch.object(self.robot, "_run_drive_for") as drive_for:
             result = self.robot.approach_bearing(180, approach_duration=0.1, clearance_cm=25)
-        self.assertEqual(result["turn_duration"], 1.0)
-        drive_for.assert_called_once_with(0.0, 90.0, 0.6, 1.0)
+        # 180 degrees at the shared 190 degrees/s figure rotate() converts with.
+        self.assertAlmostEqual(result["turn_duration"], 180 / 190, places=3)
+        drive_for.assert_called_once_with(0.0, 90.0, 0.6, 180 / 190)
 
     def test_reactive_navigation_stops_and_turns_for_obstacle(self):
         self.robot.backend.mock_distance_mm = 200
@@ -232,6 +306,70 @@ class RobotTests(unittest.TestCase):
         self.assertTrue(all(event["speed"] == 0.0 for event in turn_events))
         self.assertTrue(all(event["direction"] == 90.0 for event in turn_events))
         self.assertEqual(drive_events[-1]["speed"], 0.0)
+
+    def test_move_converts_distance_with_the_operator_calibration(self):
+        for direction, distance, expected in (
+            ("forward", 20, 0.5),
+            ("backward", 8, 0.2),
+            ("left", 2, 0.1),
+            ("right", 3, 0.15),
+        ):
+            with self.subTest(direction=direction):
+                with patch.object(self.robot, "drive_for") as drive_for:
+                    drive_for.return_value = {"direction": direction}
+                    result = self.robot.move(direction, distance_cm=distance)
+                drive_for.assert_called_once_with(direction, expected, 40)
+                self.assertEqual(result["requested_distance_cm"], distance)
+                # A timed estimate must never be reported as a measurement.
+                self.assertFalse(result["distance_measured"])
+
+    def test_move_seconds_bypasses_the_calibration_and_allows_other_speeds(self):
+        with patch.object(self.robot, "drive_for") as drive_for:
+            drive_for.return_value = {}
+            result = self.robot.move("forward", seconds=0.3, speed=60)
+        drive_for.assert_called_once_with("forward", 0.3, 60)
+        self.assertIsNone(result["requested_distance_cm"])
+
+    def test_rotate_converts_degrees_and_keeps_rotation_pure(self):
+        with patch.object(self.robot, "drive_for") as drive_for:
+            drive_for.return_value = {}
+            result = self.robot.rotate("left", degrees=95)
+        drive_for.assert_called_once_with("rotate_left", 0.5, 40)
+        self.assertEqual(result["requested_degrees"], 95)
+        self.assertEqual(result["calibration_degrees_per_second"], 190.0)
+        self.assertFalse(result["angle_measured"])
+
+    def test_move_and_rotate_require_exactly_one_of_amount_or_seconds(self):
+        for call in (
+            lambda: self.robot.move("forward"),
+            lambda: self.robot.move("forward", distance_cm=10, seconds=0.2),
+            lambda: self.robot.rotate("left"),
+            lambda: self.robot.rotate("left", degrees=90, seconds=0.2),
+        ):
+            with self.assertRaisesRegex(ValidationError, "exactly one"):
+                call()
+
+    def test_out_of_range_distance_reports_the_bound_instead_of_clamping(self):
+        with self.assertRaisesRegex(ValidationError, "at least 2 cm"):
+            self.robot.move("forward", distance_cm=1)
+        with self.assertRaisesRegex(ValidationError, "at least 1 cm"):
+            self.robot.move("left", distance_cm=0.5)
+        with self.assertRaisesRegex(ValidationError, "at most 320 cm"):
+            self.robot.move("forward", distance_cm=400)
+        with self.assertRaisesRegex(ValidationError, "at least 9.5 degrees"):
+            self.robot.rotate("right", degrees=5)
+        with self.assertRaisesRegex(ValidationError, "at most 1520 degrees"):
+            self.robot.rotate("right", degrees=1600)
+
+    def test_distance_conversion_is_refused_away_from_the_calibrated_speed(self):
+        with self.assertRaisesRegex(ValidationError, "calibrated at speed 40"):
+            self.robot.move("forward", distance_cm=20, speed=60)
+
+    def test_move_and_rotate_reject_unsupported_directions(self):
+        with self.assertRaisesRegex(ValidationError, "direction"):
+            self.robot.move("rotate_left", distance_cm=10)
+        with self.assertRaisesRegex(ValidationError, "direction"):
+            self.robot.rotate("forward", degrees=90)
 
     def test_drive_for_rejects_unsupported_direction(self):
         with self.assertRaisesRegex(ValidationError, "direction"):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .backends import HardwareBackend
 
@@ -49,6 +49,24 @@ VOICE_BROADCASTS = {
 }
 
 
+# Operator-measured open-loop calibrations at speed setting 40, recorded in
+# docs/grab_object_plan.md: 0.2 s forward/backward is about 8 cm, 0.1 s of
+# strafe about 2 cm, and rotation runs at the operator's 190 degrees/s. The
+# chassis has
+# no wheel odometry, so these convert a requested distance into a duration --
+# they never measure the travel that actually happened.
+DRIVE_CALIBRATION_CM_PER_SECOND: Dict[str, float] = {
+    "forward": 40.0,
+    "backward": 40.0,
+    "left": 20.0,
+    "right": 20.0,
+}
+ROTATION_CALIBRATION_DEGREES_PER_SECOND = 190.0
+CALIBRATED_SPEED = 40.0
+MIN_DRIVE_SECONDS = 0.05
+MAX_DRIVE_SECONDS = 8.0
+
+
 def _number(name: str, value: Any, minimum: float, maximum: float) -> float:
     if isinstance(value, bool):
         raise ValidationError(f"{name} must be a number")
@@ -87,6 +105,7 @@ class Robot:
         self._last_drive = time.monotonic()
         self._last_chassis_stop = 0.0
         self._voice_active_id = 0
+        self._button1_action: Optional[Callable[[], Any]] = None
         self._state: Dict[str, Any] = {
             "backend": getattr(backend, "details", {"name": backend.name}),
             "drive": {"speed": 0.0, "direction": 0.0, "angular_rate": 0.0},
@@ -99,6 +118,7 @@ class Robot:
             "voice_detection_count": 0,
             "voice_broadcast": None,
             "last_button": None,
+            "button_dance_count": 0,
             "button_home_count": 0,
             "watchdog_stops": 0,
             "idle_stop_heartbeats": 0,
@@ -123,6 +143,13 @@ class Robot:
     def _ensure_open(self) -> None:
         if self._closed.is_set():
             raise RobotError("Robot controller is closed")
+
+    def set_button1_action(self, action: Callable[[], Any]) -> None:
+        """Assign the server-owned asynchronous dance launcher to KEY1."""
+        if not callable(action):
+            raise TypeError("button 1 action must be callable")
+        with self._lock:
+            self._button1_action = action
 
     def drive(self, speed: Any, direction: Any, angular_rate: Any = 0) -> Dict[str, float]:
         speed_value = _number("speed", speed, 0, 100)
@@ -170,8 +197,9 @@ class Robot:
         directions = {
             "forward": (90.0, 0.0),
             "backward": (270.0, 0.0),
-            "left": (180.0, 0.0),
-            "right": (0.0, 0.0),
+            # Operator-calibrated strafing matches the corrected web controls.
+            "left": (0.0, 0.0),
+            "right": (180.0, 0.0),
             # Match the webpage turn controls exactly: rotation has no linear
             # component, uses the forward heading placeholder, and yaws at
             # +/-0.6 rather than mixing translation into the turn.
@@ -196,6 +224,115 @@ class Robot:
             "heading": motion[0],
             "angular_rate": motion[1],
             "duration": duration_value,
+        }
+
+    @staticmethod
+    def _seconds_for(
+        name: str, amount: float, rate: float, unit: str, direction: str
+    ) -> float:
+        """Convert a requested distance/angle to a duration, or explain why not.
+
+        Clamping an out-of-range request would quietly move a different amount
+        than asked, so the bounds are reported as the callable range instead.
+        """
+        seconds = amount / rate
+        if seconds < MIN_DRIVE_SECONDS:
+            raise ValidationError(
+                f"{name} must be at least {MIN_DRIVE_SECONDS * rate:g} {unit} for "
+                f"{direction}; shorter pulses are below the chassis minimum"
+            )
+        if seconds > MAX_DRIVE_SECONDS:
+            raise ValidationError(
+                f"{name} must be at most {MAX_DRIVE_SECONDS * rate:g} {unit} for "
+                f"{direction} in one bounded move"
+            )
+        return round(seconds, 3)
+
+    def _resolve_motion(
+        self,
+        direction: str,
+        amount: Any,
+        seconds: Any,
+        speed: Any,
+        *,
+        name: str,
+        rate: float,
+        unit: str,
+    ) -> Dict[str, Any]:
+        """Validate the distance-or-seconds pair shared by move and rotate."""
+        if (amount is None) == (seconds is None):
+            raise ValidationError(f"give exactly one of {name} or seconds")
+        if seconds is not None:
+            return {
+                "duration": _number("seconds", seconds, MIN_DRIVE_SECONDS, MAX_DRIVE_SECONDS),
+                "requested": None,
+            }
+        # The calibration was measured at speed 40. Converting a distance at
+        # another speed would report a figure the calibration cannot support.
+        if _number("speed", speed, 40, 100) != CALIBRATED_SPEED:
+            raise ValidationError(
+                f"{name} is calibrated at speed {CALIBRATED_SPEED:g} only; "
+                "pass seconds instead for another speed"
+            )
+        # Wide generic bounds: the calibration check below is what should
+        # speak, since it names the real limit for this direction.
+        amount_value = _number(name, amount, 0.01, 10_000)
+        return {
+            "duration": self._seconds_for(name, amount_value, rate, unit, direction),
+            "requested": amount_value,
+        }
+
+    def move(
+        self,
+        direction: Any,
+        distance_cm: Any = None,
+        seconds: Any = None,
+        speed: Any = 40,
+    ) -> Dict[str, Any]:
+        """Drive one bounded straight or strafe move by distance or duration."""
+        if not isinstance(direction, str):
+            raise ValidationError("direction must be forward, backward, left, or right")
+        key = direction.strip().lower()
+        rate = DRIVE_CALIBRATION_CM_PER_SECOND.get(key)
+        if rate is None:
+            raise ValidationError("direction must be forward, backward, left, or right")
+        motion = self._resolve_motion(
+            key, distance_cm, seconds, speed,
+            name="distance_cm", rate=rate, unit="cm",
+        )
+        result = self.drive_for(key, motion["duration"], speed)
+        return {
+            **result,
+            "requested_distance_cm": motion["requested"],
+            "calibration_cm_per_second": rate,
+            # Time-based travel from an operator calibration, not odometry.
+            "distance_measured": False,
+        }
+
+    def rotate(
+        self,
+        direction: Any,
+        degrees: Any = None,
+        seconds: Any = None,
+        speed: Any = 40,
+    ) -> Dict[str, Any]:
+        """Rotate in place by degrees or duration, without translating."""
+        if not isinstance(direction, str):
+            raise ValidationError("direction must be left or right")
+        key = direction.strip().lower().replace("rotate_", "")
+        if key not in ("left", "right"):
+            raise ValidationError("direction must be left or right")
+        rate = ROTATION_CALIBRATION_DEGREES_PER_SECOND
+        motion = self._resolve_motion(
+            key, degrees, seconds, speed,
+            name="degrees", rate=rate, unit="degrees",
+        )
+        result = self.drive_for(f"rotate_{key}", motion["duration"], speed)
+        return {
+            **result,
+            "requested_degrees": motion["requested"],
+            "calibration_degrees_per_second": rate,
+            "angle_measured": False,
         }
 
     def avoid_obstacles(self, duration: Any, speed: Any = 40, clearance_cm: Any = 30) -> Dict[str, Any]:
@@ -251,9 +388,9 @@ class Robot:
         with self._drive_lock:
             try:
                 if abs(angle) > 10:
-                    # Physical calibration: a 180-degree chassis turn takes
-                    # one second at the webpage's validated yaw rate.
-                    turn_duration = abs(angle) / 180.0
+                    # Operator-set yaw calibration, shared with rotate() so a
+                    # bearing turn and a degrees turn agree.
+                    turn_duration = abs(angle) / ROTATION_CALIBRATION_DEGREES_PER_SECOND
                     self._run_drive_for(
                         0.0,
                         90.0,
@@ -325,7 +462,7 @@ class Robot:
     def check_front(self, duration: Any = 0.8) -> Dict[str, Any]:
         """Move the arm servos to the user-defined forward-looking pose."""
         duration_value = _number("duration", duration, 0.02, 30)
-        targets = ((3, 500), (4, 2500), (5, 810), (6, 1500))
+        targets = ((3, 1200), (4, 2500), (5, 1500), (6, 1500), (1, 2200))
         with self._gesture_lock:
             commands = [
                 self.servo(servo_id, pulse, duration_value)
@@ -333,6 +470,21 @@ class Robot:
             ]
         return {
             "pose": "check_front",
+            "duration": duration_value,
+            "servos": commands,
+        }
+
+    def check_ground(self, duration: Any = 0.8) -> Dict[str, Any]:
+        """Move to the recorded ground-looking pose, including the gripper."""
+        duration_value = _number("duration", duration, 0.02, 30)
+        targets = ((3, 500), (4, 2500), (5, 1500), (6, 1500), (1, 2200))
+        with self._gesture_lock:
+            commands = [
+                self.servo(servo_id, pulse, duration_value)
+                for servo_id, pulse in targets
+            ]
+        return {
+            "pose": "check_ground",
             "duration": duration_value,
             "servos": commands,
         }
@@ -371,8 +523,8 @@ class Robot:
     def gripper(self, opened: Any, duration: Any = 0.5) -> Dict[str, Any]:
         if not isinstance(opened, bool):
             raise ValidationError("opened must be true or false")
-        # Tutorial defaults: servo 1, 2000 open and 1500 closed.
-        return self.servo(1, 2000 if opened else 1500, duration)
+        # Operator-defined full-range presets shared by web, MCP, and pickups.
+        return self.servo(1, 2500 if opened else 500, duration)
 
     def rgb(self, red: Any, green: Any, blue: Any) -> Dict[str, int]:
         command = {
@@ -523,6 +675,7 @@ class Robot:
                     if self._state["last_button"] is None
                     else dict(self._state["last_button"])
                 ),
+                "button_dance_count": self._state["button_dance_count"],
                 "button_home_count": self._state["button_home_count"],
                 "watchdog_stops": self._state["watchdog_stops"],
                 "idle_stop_heartbeats": self._state["idle_stop_heartbeats"],
@@ -562,11 +715,11 @@ class Robot:
                         self._state["idle_stop_heartbeats"] += 1
 
     def _button_loop(self) -> None:
-        """Map a press of expansion-board KEY2 to the arm Home pose."""
+        """Map expansion-board KEY1 to Dance and KEY2 to arm Home."""
         poll_button = getattr(self.backend, "button_event", None)
         if not callable(poll_button):
             return
-        last_key2_press = 0.0
+        last_button_press = {1: 0.0, 2: 0.0}
         while not self._closed.wait(0.05):
             try:
                 event = poll_button()
@@ -587,12 +740,34 @@ class Robot:
             # Hiwonder firmware versions differ here: some report the initial
             # press (1), while others report a raw click (32) or the SDK's
             # mapped click value (0).
-            if key_id != 2 or event_state not in (0x00, 0x01, 0x20):
+            if key_id not in (1, 2) or event_state not in (0x00, 0x01, 0x20):
                 continue
             now = time.monotonic()
-            if now - last_key2_press < 1.0:
+            if now - last_button_press[key_id] < 1.0:
                 continue
-            last_key2_press = now
+            last_button_press[key_id] = now
+            if key_id == 1:
+                with self._lock:
+                    action = self._button1_action
+                if action is None:
+                    print("[masterpi] KEY1 Dance action is not configured", flush=True)
+                    continue
+                print("[masterpi] KEY1 action: starting Dance", flush=True)
+                try:
+                    action()
+                except Exception as exc:
+                    print(f"[masterpi] KEY1 Dance failed: {exc}", flush=True)
+                    with self._lock:
+                        self._state["last_error"] = f"KEY1 Dance failed: {exc}"
+                else:
+                    print("[masterpi] KEY1 Dance started", flush=True)
+                    with self._lock:
+                        self._state["last_button"] = {
+                            "button": 1,
+                            "action": "dance",
+                        }
+                        self._state["button_dance_count"] += 1
+                continue
             print("[masterpi] KEY2 action: moving arm Home", flush=True)
             try:
                 self.home(1.5)

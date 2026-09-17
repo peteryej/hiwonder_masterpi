@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
@@ -11,7 +12,7 @@ import cv2
 import numpy as np
 
 from masterpi_control.backends import MockBackend
-from masterpi_control.robot import Robot
+from masterpi_control.robot import Robot, RobotError
 from masterpi_control.server import (
     DanceBusy,
     DanceLauncher,
@@ -43,10 +44,15 @@ class FakeChat:
         self.messages = []
         self.audio = []
         self.images = []
+        self.sessions = []
 
     def reply(self, message):
         self.messages.append(message)
         return f"hibot heard: {message}"
+
+    def new_session(self):
+        self.sessions.append(len(self.sessions))
+        return f"fake-session-{len(self.sessions)}"
 
     def transcribe(self, audio, content_type):
         self.audio.append((audio, content_type))
@@ -77,6 +83,7 @@ class FakeVisionGrasper:
         self.targets = []
         self.analysis_calls = []
         self.front_pickups = []
+        self.guided_calls = []
 
     def recognize_and_grab(self, target, pickup="default"):
         self.targets.append(target)
@@ -86,6 +93,21 @@ class FakeVisionGrasper:
         self.front_pickups.append(pickup)
         mode = "recorded can pickup" if pickup == "can" else "fixed ground pickup"
         return {"grabbed": True, "mode": mode, "returned_home": True, "pickup": pickup}
+
+    def grab_object(self, analyze, target=None, pickup_z=-1.0, on_event=None):
+        self.guided_calls.append({"target": target, "pickup_z": pickup_z})
+        if on_event is not None:
+            on_event({"stage": "observe", "text": "Saw stuffed toy at +0.3 cm across",
+                      "image": "data:image/jpeg;base64,AAA"})
+            on_event({"stage": "correct", "text": "Moving right 1.0 cm to centre it",
+                      "direction": "right", "distance_cm": 1.0})
+        return {
+            "grabbed": True,
+            "confirmed": True,
+            "target": target or "stuffed toy",
+            "pickup": {"x": 2.0, "y": 13.0, "z": pickup_z, "units": "cm"},
+            "finished_at": "lift pose, still holding",
+        }
 
     def analyze_scene(self, samples=3):
         self.analysis_calls.append(samples)
@@ -205,6 +227,16 @@ class DanceLauncherTests(unittest.TestCase):
 
 
 class ServerTests(unittest.TestCase):
+    def test_manual_and_mcp_gripper_routes_use_full_range_presets(self):
+        for route in ("/api/gripper", "/api/agent/gripper"):
+            for opened, pulse in ((True, 2500), (False, 500)):
+                with self.subTest(route=route, opened=opened):
+                    status, body = self.request("POST", route, {"opened": opened})
+                    self.assertEqual(status, 200)
+                    body = json.loads(body)
+                    self.assertEqual(body["result"]["servo_id"], 1)
+                    self.assertEqual(body["result"]["pulse"], pulse)
+
     def setUp(self):
         self.robot = Robot(MockBackend(), watchdog_timeout=0.3)
         self.camera = FakeCamera()
@@ -254,6 +286,18 @@ class ServerTests(unittest.TestCase):
         connection.close()
         return response.status, payload
 
+    def request_raw(self, method, path, body=None):
+        """POST and return the raw body plus content type, for NDJSON streams."""
+        connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        encoded = None if body is None else json.dumps(body)
+        headers = {} if body is None else {"Content-Type": "application/json"}
+        connection.request(method, path, encoded, headers)
+        response = connection.getresponse()
+        payload = response.read().decode("utf-8")
+        content_type = response.headers.get("Content-Type")
+        connection.close()
+        return response.status, payload, content_type
+
     def raw_request(self, method, path, body, content_type):
         status, payload, _ = self.raw_request_with_type(
             method, path, body, content_type
@@ -295,14 +339,29 @@ class ServerTests(unittest.TestCase):
         self.assertLess(page.find(b'class="pad"'), page.find(b'id="speed"'))
         self.assertLess(page.find(b'id="distanceValue"'), page.find(b'class="pad"'))
         self.assertLess(page.find(b'class="pad"'), page.find(b'id="quickHome"'))
+        for direction, arrow in ((0, "◀"), (180, "▶"), (45, "↖"), (135, "↗"), (315, "↙"), (225, "↘")):
+            self.assertIn(f'data-direction="{direction}">{arrow}</button>'.encode(), page)
+        self.assertIn(b'a:drive(0), ArrowLeft:drive(0)', page)
+        self.assertIn(b'd:drive(180), ArrowRight:drive(180)', page)
         self.assertLess(page.find(b'id="quickClose"'), page.find(b'id="sonarColor"'))
         self.assertIn(b'id="quickHome"', page)
         self.assertIn(b'id="quickCheckFront"', page)
+        self.assertEqual(page.count(b'id="quickCheckFront"'), 1)
+        self.assertIn(b'id="quickCheckGround"', page)
+        self.assertEqual(page.count(b'id="quickCheckGround"'), 1)
+        # Grab object runs the guarded skill flow; the blind fixed-point
+        # pickup keeps a button but is labelled as the quick action it is.
+        self.assertIn(b'id="quickGrabObject"', page)
+        self.assertIn(b'>Grab object</button>', page)
         self.assertIn(b'id="quickGrab"', page)
-        self.assertIn(b'id="quickGrabCan"', page)
-        self.assertIn(b'>Grab can</button>', page)
+        self.assertIn(b'>Quick grab action</button>', page)
+        self.assertNotIn(b'id="quickGrabCan"', page)
+        self.assertNotIn(b'>Grab can</button>', page)
         self.assertIn(b'id="quickOpen"', page)
         self.assertIn(b'id="quickClose"', page)
+        self.assertIn(b"document.querySelector('#quickOpen').onclick = () => api('gripper', {opened:true})", page)
+        self.assertIn(b"document.querySelector('#quickClose').onclick = () => api('gripper', {opened:false})", page)
+        self.assertIn(b"setServoSliderValue(1, opened ? 2500 : 500)", page)
         self.assertIn(b'id="quickNod"', page)
         self.assertIn(b'id="quickShake"', page)
         self.assertIn(b'id="quickDance"', page)
@@ -310,8 +369,11 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b"'gesture/shake'", page)
         self.assertIn(b"api('dance')", page)
         self.assertIn(b"api('grab', {force:true})", page)
-        self.assertIn(b"api('grab', {force:true, pickup:'can'})", page)
+        self.assertIn(b"'/api/grab/object/stream'", page)
+        self.assertIn(b"addChatMessage(event.stage === 'error'", page)
+        self.assertNotIn(b"pickup:'can'", page)
         self.assertIn(b"'pose/check_front'", page)
+        self.assertIn(b"'pose/check_ground'", page)
         self.assertIn(b"arm returned Home", page)
         self.assertEqual(page.count(b'class="quick-arm-preset secondary"'), 0)
         self.assertNotIn(b"WonderEcho voice", page)
@@ -388,6 +450,9 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b'href="/masterpi-ca.crt"', page)
         self.assertIn(b'id="speakReplies"', page)
         self.assertIn(b'id="replyAudio" controls autoplay playsinline', page)
+        self.assertIn(b'id="newChatSession"', page)
+        self.assertIn(b">New chat</button>", page)
+        self.assertIn(b"api('chat/new', {})", page)
         self.assertIn(b"/api/chat/tts", page)
         self.assertIn(b"primeReplyAudio", page)
         self.assertIn(b"decodeAudioData", page)
@@ -439,7 +504,7 @@ class ServerTests(unittest.TestCase):
         servo_events = [event for event in self.robot.backend.events if event["action"] == "servo"]
         self.assertEqual(
             [(event["servo_id"], event["pulse"]) for event in servo_events],
-            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
+            [(3, 1200), (4, 2500), (5, 1500), (6, 1500), (1, 2200)],
         )
 
     def test_explicit_color_detection_uses_local_analyzer_without_pose(self):
@@ -580,6 +645,30 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(drive_result["angular_rate"], 0.0)
         self.assertEqual(self.robot.snapshot()["drive"]["speed"], 0.0)
 
+        status, payload = self.request(
+            "POST", "/api/agent/move", {"direction": "forward", "distance_cm": 4}
+        )
+        self.assertEqual(status, 200)
+        move_result = json.loads(payload)["result"]
+        self.assertEqual(move_result["duration"], 0.1)
+        self.assertEqual(move_result["requested_distance_cm"], 4.0)
+        self.assertFalse(move_result["distance_measured"])
+
+        status, payload = self.request(
+            "POST", "/api/agent/rotate", {"direction": "right", "degrees": 19}
+        )
+        self.assertEqual(status, 200)
+        rotate_result = json.loads(payload)["result"]
+        self.assertEqual(rotate_result["duration"], 0.1)
+        self.assertEqual(rotate_result["angular_rate"], 0.6)
+        self.assertEqual(rotate_result["speed"], 0.0)
+
+        status, payload = self.request(
+            "POST", "/api/agent/move", {"direction": "forward", "distance_cm": 4, "seconds": 0.2}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("exactly one", json.loads(payload)["error"])
+
         self.robot.backend.mock_distance_mm = 200
         with patch("masterpi_control.robot.time.sleep"):
             status, payload = self.request(
@@ -629,7 +718,7 @@ class ServerTests(unittest.TestCase):
         result = json.loads(payload)["result"]
         self.assertEqual(
             [(item["servo_id"], item["pulse"]) for item in result["servos"]],
-            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
+            [(3, 1200), (4, 2500), (5, 1500), (6, 1500), (1, 2200)],
         )
 
         status, payload = self.request(
@@ -639,8 +728,20 @@ class ServerTests(unittest.TestCase):
         result = json.loads(payload)["result"]
         self.assertEqual(
             [(item["servo_id"], item["pulse"]) for item in result["servos"]],
-            [(3, 500), (4, 2500), (5, 810), (6, 1500)],
+            [(3, 1200), (4, 2500), (5, 1500), (6, 1500), (1, 2200)],
         )
+
+    def test_check_ground_pose_and_agent_apis_use_recorded_targets(self):
+        for route in ("/api/pose/check_ground", "/api/agent/check_ground"):
+            with self.subTest(route=route):
+                status, payload = self.request("POST", route, {"duration": 0.8})
+                self.assertEqual(status, 200)
+                result = json.loads(payload)["result"]
+                self.assertEqual(result["pose"], "check_ground")
+                self.assertEqual(
+                    [(item["servo_id"], item["pulse"]) for item in result["servos"]],
+                    [(3, 500), (4, 2500), (5, 1500), (6, 1500), (1, 2200)],
+                )
 
     def test_camera_guided_grab_api(self):
         status, payload = self.request("POST", "/api/grab", {"target": "blue"})
@@ -672,6 +773,111 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(result["grabbed"])
         self.assertEqual(result["mode"], "fixed ground pickup")
         self.assertEqual(self.vision_grasper.targets, [])
+
+    def test_new_chat_session_button_and_endpoint_drop_stale_context(self):
+        status, payload = self.request("POST", "/api/chat/new", {})
+        self.assertEqual(status, 200)
+        session = json.loads(payload)["result"]["session"]
+        self.assertTrue(session.startswith("fake-session-"))
+        # A second click must not reuse the first session.
+        status, payload = self.request("POST", "/api/chat/new", {})
+        self.assertNotEqual(json.loads(payload)["result"]["session"], session)
+
+    def test_web_chat_executes_an_explicit_move_instead_of_replying(self):
+        for message, direction, duration in (
+            ("move left 10 cm", "left", 0.5),
+            ("go forward 20cm", "forward", 0.5),
+            ("drive back 8 centimetres", "backward", 0.2),
+            ("strafe right for 0.3 seconds", "right", 0.3),
+        ):
+            with self.subTest(message=message):
+                with patch.object(self.robot, "_run_drive_for"):
+                    status, payload = self.request("POST", "/api/chat", {"message": message})
+                self.assertEqual(status, 200)
+                result = json.loads(payload)["result"]
+                self.assertEqual(result["action"]["name"], "move")
+                self.assertEqual(result["action"]["result"]["direction"], direction)
+                self.assertEqual(result["action"]["result"]["duration"], duration)
+                self.assertIn("Moved " + direction, result["text"])
+        # The move is performed, not narrated by the model.
+        self.assertEqual(self.chat.messages, [])
+
+    def test_web_chat_executes_an_explicit_rotation(self):
+        with patch.object(self.robot, "_run_drive_for"):
+            status, payload = self.request(
+                "POST", "/api/chat", {"message": "turn right 95 degrees"}
+            )
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(result["action"]["name"], "rotate")
+        self.assertEqual(result["action"]["result"]["direction"], "rotate_right")
+        self.assertEqual(result["action"]["result"]["duration"], 0.5)
+        self.assertIn("no gyro", result["text"])
+
+    def test_web_chat_move_without_an_amount_states_the_default(self):
+        with patch.object(self.robot, "_run_drive_for"):
+            status, payload = self.request("POST", "/api/chat", {"message": "move left"})
+        result = json.loads(payload)["result"]
+        self.assertEqual(result["action"]["result"]["requested_distance_cm"], 10.0)
+        self.assertIn("used the default", result["text"])
+
+    def test_web_chat_leaves_negated_and_ordinary_messages_alone(self):
+        for message in ("do not move left", "what is your left wheel called?"):
+            with self.subTest(message=message):
+                status, payload = self.request("POST", "/api/chat", {"message": message})
+                self.assertEqual(status, 200)
+                self.assertNotIn("action", json.loads(payload)["result"])
+        self.assertEqual(len(self.chat.messages), 2)
+
+    def test_grab_object_runs_the_guided_skill_flow(self):
+        status, payload = self.request("POST", "/api/grab/object", {})
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertTrue(result["grabbed"])
+        self.assertEqual(result["finished_at"], "lift pose, still holding")
+        # Defaults to the operator-tuned depth, and never runs the blind pickup.
+        self.assertEqual(self.vision_grasper.guided_calls, [{"target": None, "pickup_z": -1.0}])
+        self.assertEqual(self.vision_grasper.front_pickups, [])
+
+        status, payload = self.request(
+            "POST", "/api/agent/grab_object", {"target": "toy", "pickup_z": -2}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["result"]["target"], "toy")
+        self.assertEqual(
+            self.vision_grasper.guided_calls[-1], {"target": "toy", "pickup_z": -2}
+        )
+
+    def test_grab_object_stream_reports_each_step_as_it_happens(self):
+        status, payload, content_type = self.request_raw(
+            "POST", "/api/grab/object/stream", {"target": "toy"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/x-ndjson")
+        events = [json.loads(line) for line in payload.splitlines() if line.strip()]
+        self.assertEqual(
+            [event["stage"] for event in events], ["observe", "correct", "done"]
+        )
+        # Intermediate steps carry the text and image the chat panel renders,
+        # and arrive before the final result rather than with it.
+        self.assertIn("Saw stuffed toy", events[0]["text"])
+        self.assertTrue(events[0]["image"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(events[1]["distance_cm"], 1.0)
+        self.assertTrue(events[-1]["ok"])
+        self.assertEqual(events[-1]["result"]["target"], "toy")
+
+    def test_grab_object_stream_reports_a_failure_as_a_final_event(self):
+        def explode(*args, **kwargs):
+            raise RobotError("A camera-guided grasp is already running")
+
+        self.vision_grasper.grab_object = explode
+        status, payload, _ = self.request_raw("POST", "/api/grab/object/stream", {})
+        # The response is already committed, so the error is the last event.
+        self.assertEqual(status, 200)
+        last = json.loads(payload.splitlines()[-1])
+        self.assertEqual(last["stage"], "error")
+        self.assertFalse(last["ok"])
+        self.assertIn("already running", last["text"])
 
     def test_forced_can_grab_uses_recorded_can_pickup(self):
         status, payload = self.request(
@@ -718,6 +924,23 @@ class ServerTests(unittest.TestCase):
                 ("http://127.0.0.1:8000", False),
                 ("http://127.0.0.1:8000", True),
             ],
+        )
+
+    def test_button1_starts_same_dance_as_webpage(self):
+        self.robot.backend.press_button(1)
+        deadline = time.monotonic() + 0.5
+        while (
+            self.robot.snapshot()["button_dance_count"] == 0
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        self.assertEqual(
+            self.dance_launcher.urls,
+            [("http://127.0.0.1:8000", False)],
+        )
+        self.assertEqual(
+            self.robot.snapshot()["last_button"],
+            {"button": 1, "action": "dance"},
         )
 
     def test_dance_api_reports_conflict_while_dance_is_active(self):

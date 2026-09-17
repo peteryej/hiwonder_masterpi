@@ -92,19 +92,58 @@ export MASTERPI_CAMERA_DEVICE=/dev/video1
 .venv/bin/masterpi serve
 ```
 
-The **Grab object** quick-arm action immediately closes the gripper at the
-fixed ground-level pickup coordinate and returns the arm to Home while holding
-the object. It intentionally performs no camera, color, stability, or centering
-check; place the object at the calibrated ground pickup point before selecting it.
+The **Open gripper** and **Close gripper** controls (including quick-arm,
+arm-jog, and MCP `set_gripper`) use servo 1=`2500` for open and `500` for close.
+Pickup routines use the same shared presets. Check front and Check ground
+retain their separately recorded gripper observation setting of `2200`.
 
-The **Grab can** quick-arm action runs the operator-recorded can pickup profile
-without camera or color checks. It opens the gripper, moves servos 3–6 to
-`1550`, `1620`, `2500`, and `1500`, closes servo 1 at `1500`, then returns Home.
-Stage the can at the calibrated pickup point and keep hands clear.
+The chat panel's **New chat** button posts to `/api/chat/new`, which starts a
+fresh named Hermes session. The web chat otherwise continues one long-lived
+conversation, so an earlier refusal, a superseded instruction, or a scene
+described minutes ago keeps shaping later replies; this drops that history and
+clears the on-screen log. It does not affect voice conversations, which already
+open their own session per wake word.
 
-The **Check front** quick-arm preset moves servo 3 to `500`, servo 4 to `2500`,
-servo 5 to `810`, and servo 6 to `1500` over 0.8 seconds. It leaves the
-gripper on servo 1 unchanged.
+The **Grab object** quick-arm action runs the full `hibot-ground-grab`
+procedure through `POST /api/grab/object`: it moves to Check ground, finds the
+object with Hermes vision, drives the chassis in small bounded steps until the
+object's centre is at the frame centre, picks up at `(2, 13, -1)` cm, lifts to
+`(0, 15, 20)` still holding, and judges retention from two spaced camera
+frames. It reports the target, the corrections it made, and whether the hold
+was confirmed; identical frames mean a stuck stream and are never read as a
+hold. It makes one attempt - a failed grasp is reported, not retried.
+
+Its progress streams into the chat panel while it runs. The button posts to
+`/api/grab/object/stream`, which returns newline-delimited JSON: one event per
+step - what the camera saw with the annotated frame, each chassis correction
+and why, the pickup, and the verdict - so a run that moves the robot for half a
+minute is legible as it happens instead of resolving into a single line at the
+end. `POST /api/grab/object` remains the plain blocking JSON call for agents.
+Because the response is already committed when a step fails, errors arrive as a
+final `{"stage": "error", "ok": false}` event rather than an HTTP status.
+
+The **Quick grab action** (formerly *Grab object*) is the blind counterpart:
+from wherever the arm currently is, it opens the gripper, descends onto the
+fixed pickup coordinate `(2, 13, -1)` cm through a hover at `(2, 13, 8)`,
+closes, and returns Home. It performs no camera, color, stability, or centering
+check, so place the object at the calibrated pickup point before using it.
+
+The recorded can pickup profile no longer has a webpage button. It remains
+available to the `grab_from_front` agent/MCP tool, which opens the gripper,
+moves servos 3–6 to `1550`, `1620`, `2500`, and `1500`, closes servo 1 at
+`500`, then returns Home. Stage the can at the calibrated pickup point.
+
+The **Check front** quick-arm preset matches Check ground except servo 3 is
+`1200`: servo 4=`2500`, servo 5=`1500`, servo 6=`1500`, and gripper servo 1=
+`2200`. It moves over 0.8 seconds and is also used by camera analysis and
+MCP/API requests. It explicitly opens the gripper to the recorded `2200`
+setting; do not run it while holding something that must not be released.
+
+The **Check ground** quick-arm preset remains alongside Check front and
+moves servos 3–6 to `500`, `2500`,
+`1500`, and `1500`, and gripper servo 1 to `2200` over 0.8 seconds. It is also
+available through the `check_ground` MCP/voice tool. Saving the preset does not
+move the arm; it runs only when explicitly selected or requested.
 
 The **Arm position** card includes two four-direction jog pads. On the left,
 up/down changes Y and left/right changes X. On the right, up/down changes Z,
@@ -351,10 +390,13 @@ selector can play several phrases already compiled into the factory firmware.
 WonderEcho is not a general text-to-speech engine, so arbitrary text requires
 building and flashing customized WonderEcho firmware.
 
-While the controller is running, pressing physical **KEY2** on the expansion
-board moves the arm to the Home pose (`x=0, y=6, z=18, pitch=0`). Hiwonder's
-keys are active-low Raspberry Pi inputs (KEY1=GPIO13, KEY2=GPIO23); the
-controller detects the correct GPIO chip automatically.
+While the controller is running, pressing physical **KEY1** on the expansion
+board launches the same asynchronous Dance action as the webpage button,
+including synchronized audio and duplicate-run protection. Pressing **KEY2**
+moves the arm to the Home pose (`x=0, y=6, z=18, pitch=0`). Hiwonder's keys are
+active-low Raspberry Pi inputs (KEY1=GPIO13, KEY2=GPIO23); the controller
+detects the correct GPIO chip automatically. Press and click events are
+debounced so one physical press starts only one action.
 
 The server intentionally has no login and binds to all interfaces for simple
 robot-hotspot use. Only run it on the robot's private/trusted network. Bind to
@@ -368,9 +410,22 @@ Use `--mock` before `serve` to try the complete interface without hardware:
 
 ## Command-line examples
 
-Hiwonder's direction convention is 90° forward, 0° right, 180° left, and 270°
-backward; intermediate angles produce diagonal mecanum motion. Linear speed is
-0–100 mm/s and angular rate is -2–2 rad/s.
+The operator-corrected chassis mapping for this robot is 90° forward, 0° left,
+180° right, and 270° backward. Web left/right buttons, diagonal buttons,
+keyboard controls, and MCP/voice `drive_for` agree on this mapping; rotation
+controls and arm X jogs are unchanged. Raw numeric headings and the vendor
+wheel mixer are not rewritten. Intermediate angles produce diagonal mecanum
+motion. Linear speed is 0–100 mm/s and angular rate is -2–2 rad/s.
+
+The agent/MCP `move` and `rotate` actions take a distance or angle instead of a
+duration: `move` accepts `distance_cm` (2–320 cm forward/backward at 40 cm/s,
+1–160 cm strafing at 20 cm/s) and `rotate` accepts `degrees` (9.5–1520 at
+190°/s, the same constant `approach_bearing` turns with), or either takes `seconds` (0.05–8). Give exactly one of the two. The
+conversions come from the operator calibrations in `docs/grab_object_plan.md`,
+measured at speed setting 40: they are timed estimates, not odometry, so each
+result reports `distance_measured`/`angle_measured` as `false`. A distance at
+another speed is refused rather than converted, and an out-of-range amount is
+refused with its callable range instead of being clamped to a different move.
 
 ```bash
 # Move forward at 40 mm/s for one second, then stop.
@@ -421,6 +476,9 @@ object, including `/api/stop`.
 | `POST /api/stop` | `{}` |
 | `POST /api/arm` | `{"x":0,"y":6,"z":18,"pitch":0,"duration":1.5}` |
 | `POST /api/home` | `{}` |
+| `POST /api/pose/check_front` | `{"duration":0.8}` |
+| `POST /api/pose/check_ground` | `{"duration":0.8}` |
+| `POST /api/agent/check_ground` | `{"duration":0.8}` (loopback only) |
 | `POST /api/servo` | `{"servo_id":1,"pulse":1500,"duration":0.5}` |
 | `POST /api/gripper` | `{"opened":true}` |
 | `POST /api/grab` | `{"target":"red"}` |
@@ -440,11 +498,11 @@ keep the pickup area clear, and tune the fixed coordinate for your camera mount
 and table height before trying fragile objects.
 
 The Hermes/MCP and Realtime agents expose two unconditional grab actions. The
-`grab_from_ground` tool uses the low Cartesian pickup at `(0, 16.5, 0)` cm with
-a safe `-66°` pitch. The
+`grab_from_ground` tool uses the operator's Check ground image-center pickup
+at `(2, 13, -1)` cm with a `-68°` pitch preference (offline IK checked including
+servo calibration offsets) and starts from the arm's current pose. The
 `grab_from_front` tool executes the operator-recorded servo profile used by the
-webpage's **Grab can** button: servos 3–6 move to `1550`, `1620`, `2500`, and
-`1500`. Neither tool performs a camera or color check, and both return Home
+recorded can pose: servos 3–6 move to `1550`, `1620`, `2500`, and `1500`. Neither tool performs a camera or color check, and both return Home
 while holding the object.
 
 The chat understands camera questions such as **“What do you see?”**, **“What
