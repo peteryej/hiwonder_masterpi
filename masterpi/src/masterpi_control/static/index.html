@@ -435,14 +435,51 @@
       }
     }
   }
+  async function renderChatResult(result) {
+    addChatMessage('hibot', result.text);
+    if (result.vision?.annotated_image) addChatImage(result.vision.annotated_image);
+    if (result.action) addChatMessage('hibot', `Action completed: ${result.action.name}.`);
+    await speakReply(result.text);
+  }
   async function receiveChat(response) {
     const body = await response.json();
     if (!response.ok || !body.ok) throw new Error(body.error || 'Chat request failed');
     if (body.transcript) addChatMessage('user', body.transcript);
-    addChatMessage('hibot', body.result.text);
-    if (body.result.vision?.annotated_image) addChatImage(body.result.vision.annotated_image);
-    if (body.result.action) addChatMessage('hibot', `Action completed: ${body.result.action.name}.`);
-    await speakReply(body.result.text);
+    await renderChatResult(body.result);
+  }
+  // Typed messages stream: a chat-requested grab runs the guarded ground-grab
+  // procedure, and its steps belong in the log while it happens, not after.
+  async function streamChat(message) {
+    const response = await fetch('/api/chat/stream', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message}),
+    });
+    if (!response.ok || !response.body) {
+      const failure = await response.json().catch(() => ({}));
+      throw new Error(failure.error || 'Chat request failed');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let last = null;
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream:true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        last = event;
+        if (event.stage === 'done') continue;
+        setThinkingIndicator(false);
+        addChatMessage(event.stage === 'error' || event.stage === 'failed' ? 'error' : 'step', event.text);
+        if (event.image) addChatImage(event.image, event.text);
+      }
+    }
+    if (!last || last.ok === false) throw new Error(last?.text || 'Chat request failed');
+    await renderChatResult(last.result);
   }
   async function sendChatMessage() {
     const message = chatInput.value.trim();
@@ -454,7 +491,7 @@
     setThinkingIndicator(true);
     chatState.textContent = 'hibot is thinking…';
     try {
-      await receiveChat(await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message})}));
+      await streamChat(message);
       chatState.textContent = 'Ready';
     } catch (error) {
       chatState.textContent = error.message;

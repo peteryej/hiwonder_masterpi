@@ -104,22 +104,86 @@ class GuidedGrabTests(unittest.TestCase):
         self.assertGreaterEqual(correction["distance_cm"], 1.0)
         self.assertLessEqual(correction["distance_cm"], 4.0)
 
-    def test_clipped_box_drives_forward_instead_of_trusting_its_centre(self):
+    def test_clipped_sliver_drives_forward_then_stops_when_nothing_changes(self):
+        # A small box against the top edge is a sliver of something further
+        # out, so close the distance; an unchanging offset then ends the loop.
         clipped = {"description": "part of a toy", "objects": [
             {"label": "stuffed toy", "confidence": 0.9,
              "bbox": {"x_min": 0.3, "y_min": 0.0, "x_max": 0.7, "y_max": 0.38}}]}
         result, _ = self.run_grab([clipped])
-        self.assertEqual(result["grabbed"], False)
-        self.assertEqual([c["direction"] for c in result["corrections"]], ["forward"] * 6)
-        self.assertIn("could not centre", result["reason"])
+        self.assertFalse(result["grabbed"])
+        self.assertEqual([c["direction"] for c in result["corrections"]], ["forward"])
+        self.assertIn("stopped changing", result["reason"])
+        self.assertEqual([e for e in self.robot.backend.events if e["action"] == "arm"], [])
 
-    def test_missing_object_reports_instead_of_moving_the_arm(self):
+    def test_large_clipped_box_is_a_close_object_and_is_picked_up(self):
+        # The can fills the ground view and touches an edge. Trusting its
+        # visible centre is the whole point; forcing another approach walked
+        # the robot past it in a real run.
+        close = {"description": "a can right under the gripper", "objects": [
+            {"label": "red beverage can", "confidence": 0.93,
+             "bbox": {"x_min": 0.18, "y_min": 0.0, "x_max": 0.82, "y_max": 0.98}}]}
+        held = {"description": "can filling the view", "objects": [
+            {"label": "red beverage can", "confidence": 0.9,
+             "bbox": {"x_min": 0.02, "y_min": 0.02, "x_max": 0.95, "y_max": 0.95}}]}
+        self.camera.frames = [b"\xff\xd8a", b"\xff\xd8b", b"\xff\xd8c"]
+        result, _ = self.run_grab([close, held], target="can")
+        self.assertEqual(result["corrections"], [])
+        self.assertTrue(result["grabbed"])
+
+    def test_empty_ground_view_falls_through_to_check_front(self):
+        floor_only = {"description": "just the floor", "objects": [
+            {"label": "wooden floor", "confidence": 0.98,
+             "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}}]}
+        # Ground empty -> Check front sees it far out -> approach -> ground pickup.
+        far = hermes_objects(center=(0.5, 0.45), size=0.2)
+        self.camera.frames = [b"\xff\xd8a", b"\xff\xd8b", b"\xff\xd8c", b"\xff\xd8d", b"\xff\xd8e"]
+        held = {"description": "toy filling the view", "objects": [
+            {"label": "stuffed toy", "confidence": 0.9,
+             "bbox": {"x_min": 0.02, "y_min": 0.02, "x_max": 0.95, "y_max": 0.95}}]}
+        result, _ = self.run_grab([floor_only, far, hermes_objects(), held])
+        poses = [
+            (event["servo_id"], event["pulse"])
+            for event in self.robot.backend.events
+            if event["action"] == "servo" and event["servo_id"] == 3
+        ]
+        # Servo 3: 500 is Check ground, 1200 is Check front. Ground, then
+        # front, then back to ground before the pickup.
+        self.assertEqual(poses, [(3, 500), (3, 1200), (3, 500)])
+        forward = [c for c in result["corrections"] if c.get("direction") == "forward"]
+        self.assertEqual(len(forward), 1)
+        self.assertEqual(forward[0]["view"], "front")
+        self.assertEqual(forward[0]["distance_cm"], 20.0)
+        self.assertTrue(result["grabbed"])
+
+    def test_close_object_in_front_gets_a_short_approach(self):
+        floor_only = {"description": "floor", "objects": []}
+        # Box clipped at the bottom edge: at or nearer than the ~23 cm
+        # reference, so the full 20 cm approach would drive into it.
+        close = {"description": "toy right in front", "objects": [
+            {"label": "stuffed toy", "confidence": 0.9,
+             "bbox": {"x_min": 0.4, "y_min": 0.55, "x_max": 0.65, "y_max": 1.0}}]}
+        result, _ = self.run_grab([floor_only, close, hermes_objects(), hermes_objects()])
+        forward = [c for c in result["corrections"] if c.get("direction") == "forward"]
+        self.assertEqual(forward[0]["distance_cm"], 8.0)
+
+    def test_front_view_strafes_before_approaching(self):
+        floor_only = {"description": "floor", "objects": []}
+        off_to_the_side = hermes_objects(center=(0.85, 0.5), size=0.2)
+        result, _ = self.run_grab(
+            [floor_only, off_to_the_side, hermes_objects(), hermes_objects()]
+        )
+        front = [c for c in result["corrections"] if c.get("view") == "front"]
+        self.assertEqual(front[0]["direction"], "right")
+        self.assertEqual(front[-1]["direction"], "forward")
+
+    def test_object_in_neither_view_reports_without_moving_the_arm(self):
         floor_only = {"description": "just the floor", "objects": [
             {"label": "wooden floor", "confidence": 0.98,
              "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}}]}
         result, _ = self.run_grab([floor_only])
         self.assertFalse(result["grabbed"])
-        self.assertIn("no object found", result["reason"])
+        self.assertIn("ground or front view", result["reason"])
         self.assertEqual([e for e in self.robot.backend.events if e["action"] == "arm"], [])
 
     def test_identical_confirmation_frames_are_never_read_as_a_hold(self):

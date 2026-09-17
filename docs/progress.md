@@ -2,6 +2,57 @@
 
 2026-09-16
 
+## Guided grab now runs the Check front stage too
+
+- The server-side `grab_object` only implemented the skill's ground phase, so
+  an object outside the Check ground view (which covers a few cm in front of
+  the gripper) was reported missing instead of approached. It now follows the
+  skill: ground look, and when that finds nothing, `_approach_from_front` moves
+  to Check front, selects the target there, strafes until its base is within
+  the 5 cm bottom-centre tolerance (front calibration 20.67 px/cm), drives
+  forward once, and returns to Check ground. The stage runs at most once per
+  attempt, as the skill requires.
+- The approach distance is 20 cm, or 8 cm when the box touches the bottom edge:
+  that means the object is at or nearer than the ~23 cm bottom-edge reference,
+  where the full approach would drive into it.
+- A live run exposed two bugs in the ground loop, both now fixed and covered:
+  a large box always touches an edge, and the clipping rule kept forcing
+  "forward 2 cm" on a can that filled the view, burning all six corrections and
+  walking the robot past it - clipping now only forces an approach when the
+  visible part is a sliver (area < 0.30). And two corrections that leave the
+  measured offset unchanged now stop the run, instead of pulsing at an object
+  the boxes cannot localise better.
+- Tests 181 to 185: the front fallthrough with its pose sequence (ground,
+  front, ground), the short approach for a close object, the front strafe, a
+  target in neither view, the sliver-then-stall case, and a large clipped box
+  being picked up without corrections.
+
+## Chat grab requests run the skill, not the can profile
+
+- Asked in web chat to "grab the orange can", the reply described running the
+  recorded can pickup - the blind pose - rather than the guarded ground-grab
+  procedure. Same shape as the movement bug: the chat path had no grab action,
+  so the request went to the model, which answered from whatever it believed it
+  had.
+- `chat_grab_request` now recognises grab/pick up/fetch/retrieve with an object
+  phrase (negations excluded, "get" deliberately not a trigger so "get the
+  state" stays a question), and `run_chat_grab` runs `grab_object` with that
+  target and summarises the outcome. The blind can pose is unreachable from
+  chat now.
+- Target words are matched by significant word, not exact phrase
+  (`label_matches_target`): "the orange can" matches "red beverage can", since
+  the operator's word for a thing rarely matches the model's. When nothing
+  matches the named target but one graspable object is present, it picks that
+  and says so - result carries `target_requested` and `target_substituted`,
+  and the reply states the swap - rather than refusing over vocabulary.
+- Typed chat now goes through `/api/chat/stream`, so a chat-triggered grab
+  prints its steps live in the log like the button does; plain messages stream
+  a single final event and render exactly as before. The NDJSON writer was
+  generalised to `_stream_ndjson` and shared by both routes.
+- Tests 177 to 181. Verified live: "grab the orange can" streamed start ->
+  observe (with annotated frame) -> done, reported "no object found in the
+  Check ground view" with nothing in view, and never touched the can profile.
+
 ## New chat button
 
 - The web chat continues one long-lived Hermes session (`--continue

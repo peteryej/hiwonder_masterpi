@@ -450,6 +450,7 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b'href="/masterpi-ca.crt"', page)
         self.assertIn(b'id="speakReplies"', page)
         self.assertIn(b'id="replyAudio" controls autoplay playsinline', page)
+        self.assertIn(b"'/api/chat/stream'", page)
         self.assertIn(b'id="newChatSession"', page)
         self.assertIn(b">New chat</button>", page)
         self.assertIn(b"api('chat/new', {})", page)
@@ -457,9 +458,9 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b"primeReplyAudio", page)
         self.assertIn(b"decodeAudioData", page)
         self.assertIn(b"MediaRecorder", page)
-        self.assertIn(b"body.result.action", page)
+        self.assertIn(b"result.action", page)
         self.assertIn(b"Action completed:", page)
-        self.assertIn(b"body.result.vision?.annotated_image", page)
+        self.assertIn(b"result.vision?.annotated_image", page)
         self.assertIn(b"chat-vision-image", page)
         self.assertIn(b"/api/voice/conversation", page)
         self.assertIn(b"hibot is thinking", page)
@@ -773,6 +774,45 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(result["grabbed"])
         self.assertEqual(result["mode"], "fixed ground pickup")
         self.assertEqual(self.vision_grasper.targets, [])
+
+    def test_chat_grab_request_runs_the_guided_flow_not_the_can_profile(self):
+        status, payload = self.request(
+            "POST", "/api/chat", {"message": "grab the orange can"}
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(payload)["result"]
+        self.assertEqual(result["action"]["name"], "grab_object")
+        self.assertEqual(self.vision_grasper.guided_calls[-1]["target"], "orange can")
+        # Never the blind recorded can pose, and never a model-authored answer.
+        self.assertEqual(self.vision_grasper.front_pickups, [])
+        self.assertEqual(self.chat.messages, [])
+
+    def test_chat_grab_streams_each_step_before_the_reply(self):
+        status, payload, content_type = self.request_raw(
+            "POST", "/api/chat/stream", {"message": "pick up the toy"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/x-ndjson")
+        events = [json.loads(line) for line in payload.splitlines() if line.strip()]
+        self.assertEqual([e["stage"] for e in events], ["observe", "correct", "done"])
+        self.assertIn("Picked up", events[-1]["result"]["text"])
+        self.assertEqual(self.vision_grasper.guided_calls[-1]["target"], "toy")
+
+    def test_chat_stream_passes_ordinary_messages_through(self):
+        status, payload, _ = self.request_raw(
+            "POST", "/api/chat/stream", {"message": "How are you?"}
+        )
+        events = [json.loads(line) for line in payload.splitlines() if line.strip()]
+        self.assertEqual([e["stage"] for e in events], ["done"])
+        self.assertEqual(events[0]["result"]["text"], "hibot heard: How are you?")
+
+    def test_chat_leaves_negated_grabs_to_the_model(self):
+        status, payload = self.request(
+            "POST", "/api/chat", {"message": "do not grab the can"}
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("action", json.loads(payload)["result"])
+        self.assertEqual(self.vision_grasper.guided_calls, [])
 
     def test_new_chat_session_button_and_endpoint_drop_stale_context(self):
         status, payload = self.request("POST", "/api/chat/new", {})

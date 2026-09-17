@@ -97,6 +97,14 @@ arm-jog, and MCP `set_gripper`) use servo 1=`2500` for open and `500` for close.
 Pickup routines use the same shared presets. Check front and Check ground
 retain their separately recorded gripper observation setting of `2200`.
 
+A chat request to grab or pick up an object runs the same guarded
+`hibot-ground-grab` procedure as the **Grab object** button, with its steps
+streamed into the log: typed messages post to `/api/chat/stream`, and a
+recognised grab request is executed by the controller instead of being answered
+by the model. Target words are matched loosely ("the orange can" matches a
+label of "red beverage can"); if nothing matches the named target but one
+graspable object is in view, it picks that and says so.
+
 The chat panel's **New chat** button posts to `/api/chat/new`, which starts a
 fresh named Hermes session. The web chat otherwise continues one long-lived
 conversation, so an earlier refusal, a superseded instruction, or a scene

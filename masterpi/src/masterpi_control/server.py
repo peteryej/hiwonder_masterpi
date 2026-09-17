@@ -339,6 +339,60 @@ def make_handler(
             text += " You did not give an amount, so I used the default."
         return {"text": text, "action": {"name": motion["kind"], "result": result}}
 
+    def chat_grab_request(message: str) -> Optional[Dict[str, Any]]:
+        """Recognize a chat request to pick an object up off the ground.
+
+        Without this the model answers from whatever tools it happens to have
+        -- including the blind recorded can pose -- instead of the guarded
+        ground-grab procedure, which is the only path that looks, centres, and
+        verifies.
+        """
+        normalized = message.lower()
+        if re.search(
+            r"\b(?:do not|don't|never)\s+(?:please\s+)?(?:grab|pick|fetch|get)\b",
+            normalized,
+        ):
+            return None
+        match = re.search(
+            r"\b(?:grab|pick up|pickup|fetch|retrieve|pick)\b\s+"
+            r"(?:the\s+|a\s+|an\s+|my\s+|that\s+|this\s+)?"
+            r"([a-z0-9][a-z0-9 \-']{0,39}?)"
+            r"(?=\s*(?:$|[.!?,;]|\bfrom\b|\boff\b|\bon\b|\bup\b|\bplease\b))",
+            normalized,
+        )
+        if match is None:
+            return None
+        target = match.group(1).strip()
+        if target in ("it", "that", "this", "them", "one", "something", ""):
+            target = ""
+        return {"target": target or None}
+
+    def run_chat_grab(
+        request: Dict[str, Any],
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Run the guarded ground grab for a chat request and summarize it."""
+        result = grab_object({"target": request["target"]}, on_event)
+        target = result.get("target") or request["target"] or "object"
+        if result.get("grabbed"):
+            text = f"Picked up the {target} and holding it at the lift pose."
+        elif result.get("confirmed") is None and result.get("confirmation"):
+            text = (
+                f"The pickup ran for the {target}, but the camera could not confirm a "
+                f"hold: {result['confirmation']['reason']}. Treating it as unproven."
+            )
+        else:
+            reason = result.get("reason") or (
+                result.get("confirmation") or {}
+            ).get("reason") or "unknown reason"
+            text = f"Did not grab it: {reason}. Ask me to try again if you want another attempt."
+        if result.get("target_substituted"):
+            text += (
+                f" You asked for the {request['target']}; the ground view had "
+                f"{result['target']}, so that is what I went for."
+            )
+        return {"text": text, "action": {"name": "grab_object", "result": result}}
+
     def chat_reply(data: Dict[str, Any]) -> Dict[str, Any]:
         message = data.get("message")
         if not isinstance(message, str) or not message.strip():
@@ -346,6 +400,9 @@ def make_handler(
         message = message.strip()
         if len(message) > 4000:
             raise ValidationError("message must be at most 4000 characters")
+        grab_request = chat_grab_request(message)
+        if grab_request is not None and grasper is not None:
+            return run_chat_grab(grab_request)
         motion = chat_motion_request(message)
         if motion is not None:
             # Just do it: an explicitly named bounded move is not gated on a
@@ -510,10 +567,12 @@ def make_handler(
             else:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
 
-        def _stream_grab_object(self, data: Dict[str, Any]) -> None:
-            """Run Grab object, writing each step as it happens.
+        def _stream_ndjson(
+            self, run: Callable[[Callable[[Dict[str, Any]], None]], Dict[str, Any]]
+        ) -> None:
+            """Run a long action, writing each step as it happens.
 
-            The run takes tens of seconds and moves the robot, so the operator
+            These runs take tens of seconds and move the robot, so the operator
             needs to see what it saw and why it moved while it is happening,
             not a single verdict at the end. Newline-delimited JSON keeps the
             client a three-line reader.
@@ -529,17 +588,36 @@ def make_handler(
                 self.wfile.flush()
 
             try:
-                result = grab_object(data, write)
-            except (RobotError, CameraUnavailable, ChatError) as exc:
+                result = run(write)
+            except (RobotError, CameraUnavailable, ChatError, ValidationError) as exc:
                 # The response is already committed, so an error is the last
                 # event rather than an HTTP status the client never sees.
                 write({"stage": "error", "text": str(exc), "ok": False})
                 return
             except Exception as exc:  # pragma: no cover - unexpected failure
-                LOG.exception("Grab object stream failed")
+                LOG.exception("Streaming action failed")
                 write({"stage": "error", "text": str(exc), "ok": False})
                 return
             write({"stage": "done", "ok": True, "result": result})
+
+        def _stream_grab_object(self, data: Dict[str, Any]) -> None:
+            self._stream_ndjson(lambda write: grab_object(data, write))
+
+        def _stream_chat(self, data: Dict[str, Any]) -> None:
+            """Answer a chat message, streaming a grab request's steps.
+
+            Plain messages stream nothing extra: the client sees one final
+            event and renders it exactly as the non-streaming reply.
+            """
+            def run(write: Callable[[Dict[str, Any]], None]) -> Dict[str, Any]:
+                message = data.get("message")
+                if isinstance(message, str) and grasper is not None:
+                    request = chat_grab_request(message.strip())
+                    if request is not None:
+                        return run_chat_grab(request, write)
+                return chat_reply(data)
+
+            self._stream_ndjson(run)
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
@@ -552,6 +630,9 @@ def make_handler(
             try:
                 if path == "/api/grab/object/stream":
                     self._stream_grab_object(self._read_json())
+                    return
+                if path == "/api/chat/stream":
+                    self._stream_chat(self._read_json())
                     return
                 if path == "/api/chat/audio":
                     audio, content_type = self._read_audio()

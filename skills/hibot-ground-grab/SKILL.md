@@ -231,10 +231,23 @@ For the uncropped 640 x 480 camera image:
    After an authorized retry, report the adjustment you made and its outcome,
    so the depth and alignment notes above stay grounded in what happened.
 
-The webpage's **Grab object** button (`POST /api/grab/object`) runs this same
-procedure server-side - Check ground, bounded centring, pickup, paired
-confirmation - for an operator who wants it in one click. Its **Quick grab
+The webpage's **Grab object** button and a chat request to grab something both
+run this same procedure server-side (`POST /api/grab/object`,
+`POST /api/chat/stream`): Check ground first, the Check front stage and
+approach when the ground view is empty, bounded centring, pickup, paired
+confirmation - with every step streamed into the chat log. Its **Quick grab
 action** button is the blind fixed-point pickup, not this.
+
+Two rules that implementation learned the hard way, and that apply when you run
+the stages by hand too:
+
+- **A large box touching an edge is a close object overflowing the view, not a
+  sliver of a distant one.** Only treat clipping as "approach again" when the
+  visible part is small; otherwise trust its centre. Forcing another approach
+  on a can that filled the ground view walked the robot straight past it.
+- **If a correction does not change the measured offset, stop.** Two identical
+  readings mean the model's boxes, not the chassis, are the limit; further
+  pulses only push the object around.
 
 **Do not substitute the `grab_from_ground` MCP quick action for step 6.**
 It picks up at the same `(2,13,-1)` depth but skips the Check ground look, the

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib
 import logging
+import re
 import threading
 import time
 from collections import Counter
@@ -30,6 +31,24 @@ MAX_ALIGNMENT_CORRECTIONS = 6
 # pulses, so each one is followed by a fresh observation.
 LATERAL_STEP_RANGE_CM = (1.0, 4.0)
 FORWARD_STEP_RANGE_CM = (2.0, 5.0)
+# Check front calibration from docs/grab_object_plan.md: 124 px = 6 cm near
+# centre-bottom, and the image's bottom edge is about 23 cm ahead.
+FRONT_PIXELS_PER_CM = 20.67
+FRONT_TOLERANCE_CM = 5.0
+FRONT_APPROACH_CM = 20.0
+# A box already touching the bottom edge is at the ~23 cm reference or nearer,
+# so the full approach would drive into it.
+FRONT_CLOSE_APPROACH_CM = 8.0
+MAX_FRONT_CORRECTIONS = 3
+# A box touching an edge is only a reason to close the distance when what is
+# visible is a sliver of a distant object. A large object simply overflows the
+# ground view when it is close enough to grasp, and its visible centre is the
+# best estimate there is -- treating that as "clipped, correct again" walks the
+# robot past the object forever.
+SLIVER_AREA_RATIO = 0.30
+# Two corrections that do not move the offset mean the model's boxes, not the
+# chassis, are the limit; more pulses will not help.
+MIN_CORRECTION_PROGRESS_CM = 0.3
 CONFIRM_DELAY_SECONDS = 1.5
 # A held object sits right at the gripper camera and fills the near field.
 HELD_AREA_RATIO = 0.45
@@ -61,6 +80,29 @@ def _box_metrics(bbox: Mapping[str, Any]) -> Dict[str, float]:
     }
 
 
+# Words that carry no object identity when matching a spoken target.
+TARGET_STOPWORDS = frozenset({
+    "the", "a", "an", "my", "that", "this", "some", "please", "object", "thing",
+    "it", "one", "there", "here", "up", "off", "from", "on", "floor", "ground",
+})
+
+
+def label_matches_target(label: Any, target: str) -> bool:
+    """True when a Hermes label names what the operator asked for.
+
+    The operator's words rarely match the model's: "the orange can" against
+    "red beverage can". Matching on the significant words, not the phrase,
+    keeps a colour or filler word from losing the object.
+    """
+    label_words = set(re.findall(r"[a-z0-9]+", str(label).lower()))
+    target_text = target.lower()
+    if target_text and target_text in str(label).lower():
+        return True
+    wanted = {word for word in re.findall(r"[a-z0-9]+", target_text)
+              if word not in TARGET_STOPWORDS}
+    return bool(wanted & label_words)
+
+
 def select_ground_target(objects: Any, target: Any = None) -> Optional[Dict[str, Any]]:
     """Pick the object to grasp from one Hermes analysis.
 
@@ -81,7 +123,7 @@ def select_ground_target(objects: Any, target: Any = None) -> Optional[Dict[str,
         if metrics["area"] <= 0 or metrics["area"] > 0.97:
             continue
         if wanted is not None:
-            if wanted not in label.lower():
+            if not label_matches_target(label, wanted):
                 continue
         elif _is_background(label):
             continue
@@ -429,6 +471,88 @@ class VisionGrasper:
             "image": image,
         }
 
+    def _approach_from_front(
+        self,
+        analyze: Callable[[bytes], Dict[str, Any]],
+        target: Any,
+        emit: Callable[..., None],
+        corrections: List[Dict[str, Any]],
+    ) -> bool:
+        """Find the object further out in Check front and drive up to it.
+
+        The ground view only covers the few centimetres in front of the
+        gripper, so an object outside it is not missing -- it is just further
+        away. This is the skill's Check front stage: align on the object's
+        base near image bottom-centre, then close the distance once.
+        """
+        emit(
+            "check_front",
+            "Nothing in the ground view. Looking further ahead from the Check front pose.",
+        )
+        self.robot.check_front(0.8)
+        time.sleep(1.0)
+        chosen = None
+        for _ in range(MAX_FRONT_CORRECTIONS + 1):
+            observation = self._observe_ground(analyze)
+            analysis = observation["analysis"]
+            chosen = select_ground_target(analysis.get("objects"), target)
+            if chosen is None and target:
+                chosen = select_ground_target(analysis.get("objects"))
+            if chosen is None:
+                emit(
+                    "failed",
+                    "Not in the Check front view either: "
+                    + str(analysis.get("description") or "no description"),
+                    image=self._annotated_data_uri(
+                        observation["frame"], analysis.get("objects")
+                    ),
+                )
+                return False
+            # Front alignment is on the object's base at bottom-centre, and
+            # only sideways: the approach itself closes the distance.
+            offset_x_cm = (chosen["center_x"] - 0.5) * 640 / FRONT_PIXELS_PER_CM
+            emit(
+                "observe",
+                f"Check front shows {chosen['label']} {offset_x_cm:+.1f} cm across"
+                + (" - lined up, approaching." if abs(offset_x_cm) <= FRONT_TOLERANCE_CM
+                   else " - strafing to line up."),
+                target=chosen["label"],
+                offset_x_cm=round(offset_x_cm, 2),
+                image=self._annotated_data_uri(
+                    observation["frame"], analysis.get("objects")
+                ),
+            )
+            if abs(offset_x_cm) <= FRONT_TOLERANCE_CM:
+                break
+            direction = "right" if offset_x_cm > 0 else "left"
+            low, high = LATERAL_STEP_RANGE_CM
+            step = min(max(abs(offset_x_cm), low), high)
+            emit("correct", f"Moving {direction} {step:.1f} cm.",
+                 direction=direction, distance_cm=round(step, 2))
+            self.robot.move(direction, distance_cm=round(step, 2))
+            corrections.append({"view": "front", "direction": direction,
+                                "distance_cm": round(step, 2)})
+            time.sleep(0.8)
+
+        approach = (
+            FRONT_CLOSE_APPROACH_CM if chosen["clipped_bottom"] else FRONT_APPROACH_CM
+        )
+        emit(
+            "correct",
+            f"Driving forward {approach:g} cm to bring it into the ground view"
+            + (" (it is already close, so a short hop)." if chosen["clipped_bottom"] else "."),
+            direction="forward",
+            distance_cm=approach,
+        )
+        self.robot.move("forward", distance_cm=approach)
+        corrections.append({"view": "front", "direction": "forward",
+                            "distance_cm": approach})
+        time.sleep(0.8)
+        emit("check_ground", "Back to the Check ground pose to line up the pickup.")
+        self.robot.check_ground(0.8)
+        time.sleep(1.2)
+        return True
+
     def grab_object(
         self,
         analyze: Callable[[bytes], Dict[str, Any]],
@@ -464,16 +588,35 @@ class VisionGrasper:
         if not self._lock.acquire(blocking=False):
             raise RobotError("A camera-guided grasp is already running")
         corrections: List[Dict[str, Any]] = []
+        substituted = False
+        front_stage_done = False
+        previous_offsets: Optional[Tuple[float, float]] = None
         try:
             emit("start", "Grab object: looking at the ground first."
                  + (f" Target: {target}." if target else ""))
             self.robot.stop()
             self.robot.check_ground(0.8)
             time.sleep(1.2)
-            for _ in range(MAX_ALIGNMENT_CORRECTIONS + 1):
+            # One extra pass covers the Check front detour, which consumes an
+            # iteration without making a ground correction.
+            for _ in range(MAX_ALIGNMENT_CORRECTIONS + 2):
                 observation = self._observe_ground(analyze)
                 analysis = observation["analysis"]
                 chosen = select_ground_target(analysis.get("objects"), target)
+                if chosen is None and target:
+                    # The operator's word for it rarely matches the model's
+                    # ("the toy" against "plush teddy bear"), so fall back to
+                    # the one graspable object and say what was picked.
+                    chosen = select_ground_target(analysis.get("objects"))
+                    if chosen is not None and not substituted:
+                        substituted = True
+                        emit(
+                            "observe",
+                            f"Nothing here is labelled '{target}'. The ground view has "
+                            f"{chosen['label']}, so that is what I will pick up.",
+                            target=chosen["label"],
+                            target_requested=str(target),
+                        )
                 if chosen is None:
                     emit(
                         "observe",
@@ -483,24 +626,38 @@ class VisionGrasper:
                             observation["frame"], analysis.get("objects")
                         ),
                     )
+                    if not front_stage_done:
+                        front_stage_done = True
+                        if self._approach_from_front(analyze, target, emit, corrections):
+                            continue
+                        return {
+                            "grabbed": False,
+                            "reason": "object not found in the ground or front view",
+                            "target_requested": str(target) if target else None,
+                            "description": analysis.get("description"),
+                            "corrections": corrections,
+                        }
                     return {
                         "grabbed": False,
                         "reason": "no object found in the Check ground view",
+                        "target_requested": str(target) if target else None,
                         "description": analysis.get("description"),
                         "corrections": corrections,
                     }
                 offset_x_cm = (chosen["center_x"] - 0.5) * 640 / GROUND_PIXELS_PER_CM
                 offset_y_cm = (chosen["center_y"] - 0.5) * 480 / GROUND_PIXELS_PER_CM
-                # A clipped box hides part of the object, so its centre is not
-                # the object's centre: close the gap before trusting it.
-                if chosen["clipped_top"]:
+                # A clipped sliver hides most of the object, so its centre is
+                # not the object's centre: close the gap before trusting it.
+                # A large clipped box is a close object overflowing the view.
+                sliver = chosen["area"] < SLIVER_AREA_RATIO
+                if sliver and chosen["clipped_top"]:
                     offset_y_cm = min(offset_y_cm, -FORWARD_STEP_RANGE_CM[0])
-                elif chosen["clipped_bottom"]:
+                elif sliver and chosen["clipped_bottom"]:
                     offset_y_cm = max(offset_y_cm, FORWARD_STEP_RANGE_CM[0])
                 aligned = (
                     abs(offset_x_cm) <= CENTER_TOLERANCE_CM
                     and abs(offset_y_cm) <= CENTER_TOLERANCE_CM
-                    and not chosen["clipped"]
+                    and not (chosen["clipped"] and sliver)
                 )
                 emit(
                     "observe",
@@ -518,6 +675,25 @@ class VisionGrasper:
                 )
                 if aligned:
                     break
+                if previous_offsets is not None and all(
+                    abs(now - before) < MIN_CORRECTION_PROGRESS_CM
+                    for now, before in zip((offset_x_cm, offset_y_cm), previous_offsets)
+                ):
+                    emit(
+                        "failed",
+                        f"The last correction did not move {chosen['label']} "
+                        f"({offset_x_cm:+.1f} cm across, {offset_y_cm:+.1f} cm away). "
+                        "Stopping rather than pulsing at it.",
+                    )
+                    return {
+                        "grabbed": False,
+                        "reason": "corrections stopped changing the measured offset",
+                        "target": chosen["label"],
+                        "offset_x_cm": round(offset_x_cm, 2),
+                        "offset_y_cm": round(offset_y_cm, 2),
+                        "corrections": corrections,
+                    }
+                previous_offsets = (offset_x_cm, offset_y_cm)
                 if len(corrections) >= MAX_ALIGNMENT_CORRECTIONS:
                     emit(
                         "failed",
@@ -584,6 +760,8 @@ class VisionGrasper:
                 "confirmed": confirmation["held"],
                 "confirmation": confirmation,
                 "target": chosen["label"],
+                "target_requested": str(target) if target else None,
+                "target_substituted": substituted,
                 "offset_x_cm": round(offset_x_cm, 2),
                 "offset_y_cm": round(offset_y_cm, 2),
                 "corrections": corrections,
